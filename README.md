@@ -116,15 +116,23 @@ On by default; skip with `--no-reconcile-spelling` (roughly doubles MinerU's
 per-document runtime — the reference pass costs about 40s on top of
 `hybrid-engine`'s ~85s).
 
+## Setup
+
+Fresh machine (including WSL2): run `./check-deps.sh` first — verifies/installs
+git, Docker Engine, NVIDIA Container Toolkit (only if a GPU is present), and
+`inotify-tools` (for `watch.sh`). Safe to re-run at any point.
+
 ## Build
 
 ```bash
 # text engine (CPU only, no GPU)
 cd engines/text && docker build -t pdf2md-text .
 
-# mineru engine — build the upstream base first (large, slow, one-time)
+# mineru engine — build the upstream base first (large, slow, one-time).
+# Dockerfile.mineru is a pinned copy of MinerU's own official base image
+# definition, committed here for a reproducible build that doesn't depend
+# on an external URL staying available/unchanged.
 cd engines/mineru
-wget https://gcore.jsdelivr.net/gh/opendatalab/MinerU@master/docker/global/Dockerfile -O Dockerfile.mineru
 docker build -t mineru:latest -f Dockerfile.mineru .
 docker build -t pdf2md-mineru .
 ```
@@ -135,11 +143,14 @@ no weights to cache.
 
 ## Requirements
 
-- Docker with GPU passthrough for the MinerU engine
-  (`docker run --rm --gpus all nvidia/cuda:12.5.0-base-ubuntu22.04 nvidia-smi`
-  should show your GPU). The text engine needs no GPU.
+- Docker with GPU passthrough for the MinerU engine — `check-deps.sh`
+  verifies this with `docker run --rm --gpus all
+  nvidia/cuda:12.5.0-base-ubuntu22.04 nvidia-smi`, which should show your
+  GPU. The text engine needs no GPU.
 - `--shm-size 32g --ipc=host` for MinerU's vLLM-based hybrid backend (already
   set in `engines/mineru/mineru.sh`).
+- `inotify-tools`, only if you want `watch.sh`'s folder watcher (not needed
+  for direct `pdf2md-auto.sh` use).
 
 ## Layout
 
