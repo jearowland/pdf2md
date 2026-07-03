@@ -1,0 +1,28 @@
+# Runtime logs
+logs/*.log
+
+# Generated markdown output and rotation-corrected intermediates (anywhere,
+# including test-fixtures/ if a fixture gets run in place)
+*.derotated.pdf
+
+# test-fixtures/ is for LOCAL testing only, never committed -- confirmed a
+# real problem: real third-party documents (actual charity financial
+# reports, used during development) ended up committed here and in git
+# history, found during a pre-publish audit. Drop your own local test
+# files here; none of them should ever be tracked.
+test-fixtures/*
+!test-fixtures/README.md
+
+# Local Claude Code settings (machine-specific, not part of the tool)
+.claude/
+
+# watch.sh's default drop folder -- runtime user data, not part of the tool
+inbox/
+
+# Editor/OS cruft
+.DS_Store
+*.swp
+
+# Windows download metadata that sometimes rides along with fetched files
+*:Zone.Identifier
+__pycache__/
