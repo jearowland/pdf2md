@@ -29,6 +29,19 @@ recovery hook).
 Usage:
   python3 verify_numbers.py document.pdf output.md
   python3 verify_numbers.py document.pdf output.md --json   # full detail
+
+Manual recovery runbook (when the alarm fires materially):
+  1. Run with --json to get missing_pages.
+  2. For each missing page, extract its raw text layer (PyMuPDF
+     page.get_text()) and append it to the markdown as a marked section:
+       <!-- recovered: page N raw text layer (see verify_numbers) -->
+  3. Re-run this verifier to confirm coverage.
+  Appending (not replacing) preserves the engine's superior structure for
+  everything it converted correctly; the marker keeps recoveries auditable.
+  Automating this (page-targeted recovery inside pdf2md-auto.sh) is a
+  designed-but-unbuilt feature -- on a corpus of ~3,800 real financial
+  reports the alarm fired materially on only 4 documents (~0.1%), which
+  did not justify the machinery. Build it if a future corpus disagrees.
 """
 from __future__ import annotations
 import argparse
