@@ -183,12 +183,39 @@ else
   echo "[pdf2md-auto] auto-routed: $CLASS -> engine=$ENGINE" >&2
 fi
 
+# Post-conversion verification (report-only): when the caller asked for a
+# file output (-o), check that the markdown kept the money-like numbers the
+# PDF's text layer contains -- layout engines can silently drop blocks
+# (small appendix-style tables especially), and this makes that visible at
+# conversion time. Never changes the exit code; scanned PDFs (no text
+# layer) report as unverifiable, not as failures.
+OUT_MD=""
+prev=""
+for a in "${ARGS[@]}"; do
+  if [ "$prev" = "-o" ] || [ "$prev" = "--output" ]; then OUT_MD="$a"; fi
+  prev="$a"
+done
+
+run_and_verify() {
+  "$@"
+  local rc=$?
+  # the -o handling above rewrites the path relative to the input's dir
+  case "$OUT_MD" in /*) : ;; ?*) OUT_MD="$DIR/$OUT_MD" ;; esac
+  if [ $rc -eq 0 ] && [ -n "$OUT_MD" ] && [ -f "$OUT_MD" ]; then
+    local odir; odir=$(cd "$(dirname "$OUT_MD")" && pwd)
+    docker run --rm -v "$DIR":/work -v "$odir":/out --user "$(id -u):$(id -g)"       -e HOME=/tmp -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro       --entrypoint python3 pdf2md-text /usr/local/bin/verify_numbers.py       "/work/$BASE" "/out/$(basename "$OUT_MD")" || true
+  fi
+  return $rc
+}
+
 case "$ENGINE" in
   text)
-    exec "$TEXT_DIR/pdf2md.sh" "$IN" "${ARGS[@]}"
+    run_and_verify "$TEXT_DIR/pdf2md.sh" "$IN" "${ARGS[@]}"
+    exit $?
     ;;
   mineru)
-    exec "$MINERU_DIR/mineru.sh" "$IN" "${ARGS[@]}"
+    run_and_verify "$MINERU_DIR/mineru.sh" "$IN" "${ARGS[@]}"
+    exit $?
     ;;
   marker)
     echo "[pdf2md-auto] ERROR: the Marker engine was archived (never won a single test vs" >&2
