@@ -505,7 +505,7 @@ def main():
                          "characters counts as needing OCR too -- a font subsetted without a "
                          "proper ToUnicode CMap looks like plenty of 'text' by character count but "
                          "is undecodable garbage; confirmed on a real corpus that clean pages "
-                         "measure exactly 0.0 here, affected ones 5%-76%, so this default has a "
+                         "measure exactly 0.0 here, affected ones 5%%-76%%, so this default has a "
                          "wide safety margin (default 0.05)")
     ap.add_argument("--classify-only", action="store_true",
                     help="print 'digital' or 'scan' to stdout and exit (no model load); "
