@@ -29,8 +29,17 @@
 #
 #   ./pdf2md-auto.sh report.pdf                  # markdown to stdout
 #   ./pdf2md-auto.sh report.pdf -o report.md     # markdown to file (beside the PDF)
-#   ./pdf2md-auto.sh report.pdf --engine text    # force the fast CPU path
-#   ./pdf2md-auto.sh report.pdf --engine mineru  # force MinerU
+#                                                # (+ report.manifest.json sibling)
+#   ./pdf2md-auto.sh report.pdf --route whole-doc  # pre-2026-07 whole-document routing
+#   ./pdf2md-auto.sh report.pdf --engine text    # force the fast CPU path (whole doc)
+#   ./pdf2md-auto.sh report.pdf --engine mineru  # force MinerU (whole doc)
+#
+# DEFAULT PDF path (2026-07): per-page engine routing (pdf2md_route.py) --
+# each page classified text|ocr and each contiguous same-class run converted
+# by the right engine, merged with global page numbers, plus a per-page
+# fact manifest. Mixed documents (digital filings with scanned signature
+# pages; image-dense DTP documents with perfect text layers) are exactly
+# what whole-document routing got wrong in both directions.
 #   ./pdf2md-auto.sh report.docx -o report.md    # Word -> markdown
 #   ./pdf2md-auto.sh report.xlsx -o report.md    # Excel -> markdown
 #
@@ -92,10 +101,13 @@ EXT="$(echo "$EXT" | tr '[:upper:]' '[:lower:]')"
 
 FORCE_ENGINE=""
 SKIP_DEROTATE=""
+ROUTE="page"   # page (default): per-page engine routing via pdf2md_route.py;
+               # whole-doc: the pre-2026-07 whole-document classify-and-route
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --engine) FORCE_ENGINE="$2"; shift 2 ;;
+    --route) ROUTE="$2"; shift 2 ;;
     --no-derotate) SKIP_DEROTATE=1; shift ;;
     -o|--output)
       # -o gets forwarded into a container where only $DIR (mounted as /work) is
@@ -167,10 +179,40 @@ else
   echo "[pdf2md-auto] --no-derotate: skipping rotation check" >&2
 fi
 
-if [ -n "$FORCE_ENGINE" ]; then
+# Per-page routing is the DEFAULT for PDFs (2026-07): the unit of conversion
+# failure is the page -- mixed documents (a digital filing with a few scanned
+# pages; an image-dense DTP document with a perfect text layer) defeat any
+# whole-document choice. --route whole-doc restores the previous behaviour;
+# --engine forces every page through one engine (whole-document by
+# construction). The router derotates by itself, so the derotated copy made
+# above is handed over with --no-derotate to avoid doing the work twice.
+if [ -z "$FORCE_ENGINE" ] && [ "$ROUTE" = "page" ]; then
+  # pull -o back out of ARGS: the router needs the host path (it writes a
+  # <out>.manifest.json sibling); with no -o (stdout mode) use a temp
+  # sibling and drop the manifest -- stdout callers have nowhere to put it.
+  ROUTE_OUT=""
+  PASS=()
+  prev=""
+  for a in "${ARGS[@]+"${ARGS[@]}"}"; do
+    if [ "$prev" = "-o" ]; then ROUTE_OUT="$DIR/$a"; prev=""; continue; fi
+    if [ "$a" = "-o" ]; then prev="-o"; continue; fi
+    PASS+=("$a")
+  done
+  if [ -n "$ROUTE_OUT" ]; then
+    exec python3 "$SCRIPT_DIR/pdf2md_route.py" "$IN" -o "$ROUTE_OUT" \
+      --no-derotate ${PASS[@]+"${PASS[@]}"}
+  else
+    TMP_MD="$DIR/$STEM.routed.tmp.md"
+    python3 "$SCRIPT_DIR/pdf2md_route.py" "$IN" -o "$TMP_MD" \
+      --no-derotate ${PASS[@]+"${PASS[@]}"}
+    cat "$TMP_MD"
+    rm -f "$TMP_MD" "${TMP_MD%.md}.manifest.json"
+    exit 0
+  fi
+elif [ -n "$FORCE_ENGINE" ]; then
   ENGINE="$FORCE_ENGINE"
-  echo "[pdf2md-auto] forced engine: $ENGINE" >&2
-else
+  echo "[pdf2md-auto] forced engine: $ENGINE (whole-document)" >&2
+elif [ "$ROUTE" = "whole-doc" ]; then
   # Cheap classify: no GPU, no model load needed on this path.
   CLASS=$(docker run --rm -v "$DIR":/work --user "$(id -u):$(id -g)" -e HOME=/tmp \
     -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
@@ -180,7 +222,10 @@ else
     scan)    ENGINE="mineru" ;;
     *) echo "[pdf2md-auto] ERROR: unexpected classify output: '$CLASS'" >&2; exit 3 ;;
   esac
-  echo "[pdf2md-auto] auto-routed: $CLASS -> engine=$ENGINE" >&2
+  echo "[pdf2md-auto] auto-routed (whole-doc): $CLASS -> engine=$ENGINE" >&2
+else
+  echo "[pdf2md-auto] ERROR: unknown --route '$ROUTE' (expected page|whole-doc)" >&2
+  exit 2
 fi
 
 # Post-conversion verification (report-only): when the caller asked for a

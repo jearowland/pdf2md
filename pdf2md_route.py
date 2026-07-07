@@ -280,6 +280,8 @@ def main():
         for (a, b, eng), piece_md in parts:
             if piece_md != out_md:
                 piece_md.unlink(missing_ok=True)
+            # engines write provenance siblings per piece; remove those too
+            Path(str(piece_md)[:-3] + ".content_list.json").unlink(missing_ok=True)
             piece_pdf = workdir / f"{stem}.p{a:04d}-{b:04d}.pdf"
             piece_pdf.unlink(missing_ok=True)
 
