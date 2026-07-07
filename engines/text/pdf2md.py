@@ -185,25 +185,35 @@ def classify(pdf_path, min_page_chars, garbage_char_ratio=0.05, image_coverage_t
     import fitz  # PyMuPDF
     doc = fitz.open(pdf_path)
     needs_ocr, garbage_pages, image_pages, total_chars = [], [], [], 0
+    per_page = []  # one fact-row per page, consumed by --classify-pages routing
     for i in range(len(doc)):
         page = doc[i]
         txt = page.get_text("text")
         n = len(txt.strip())
         total_chars += n
+        cov = _page_image_coverage(page)
+        reasons = []
         if n < min_page_chars:
+            reasons.append("low_text")
+        else:
+            garbage_ratio = len(CONTROL_CHAR_RE.findall(txt)) / max(len(txt), 1)
+            if garbage_ratio > garbage_char_ratio:
+                reasons.append("garbage_text")
+            if cov > image_coverage_threshold:
+                reasons.append("image_page")
+        per_page.append({"page": i + 1, "text_chars": n,
+                         "image_coverage": round(cov, 3),
+                         "class": "ocr" if reasons else "text",
+                         "reasons": reasons})
+        if reasons:
             needs_ocr.append(i + 1)
-            continue
-        garbage_ratio = len(CONTROL_CHAR_RE.findall(txt)) / max(len(txt), 1)
-        if garbage_ratio > garbage_char_ratio:
-            needs_ocr.append(i + 1)
-            garbage_pages.append(i + 1)
-            continue
-        if _page_image_coverage(page) > image_coverage_threshold:
-            needs_ocr.append(i + 1)
-            image_pages.append(i + 1)
+            if "garbage_text" in reasons:
+                garbage_pages.append(i + 1)
+            if "image_page" in reasons:
+                image_pages.append(i + 1)
     pc = len(doc)
     doc.close()
-    return pc, needs_ocr, total_chars, garbage_pages, image_pages
+    return pc, needs_ocr, total_chars, garbage_pages, image_pages, per_page
 
 
 def detect_and_fix_rotation(pdf_path, output_path, dpi, min_confidence, log):
@@ -500,6 +510,20 @@ def main():
     ap.add_argument("--classify-only", action="store_true",
                     help="print 'digital' or 'scan' to stdout and exit (no model load); "
                          "used by pdf2md-auto.sh to route between the text/mineru engines")
+    ap.add_argument("--classify-pages", action="store_true",
+                    help="print a per-page JSON classification report and exit (no model "
+                         "load). One fact-row per page: class 'text'|'ocr', reasons "
+                         "(low_text/garbage_text/image_page), text_chars, image_coverage. "
+                         "Used by pdf2md_route.py to route each page to the right engine "
+                         "instead of forcing a whole-document choice -- the mixed-document "
+                         "failure mode (a digital filing with a few scanned/pasted pages, "
+                         "or an image-dense DTP document with a perfect text layer) is "
+                         "exactly what whole-document routing cannot express.")
+    ap.add_argument("--slice", metavar="A-B",
+                    help="write pages A..B (1-indexed, inclusive) to the path given by -o "
+                         "and exit. A pure page copy (no re-rendering, annotations and "
+                         "resources preserved); used by pdf2md_route.py to hand each "
+                         "same-class page run to its engine.")
     ap.add_argument("--derotate", metavar="OUTPUT.pdf",
                     help="detect per-page rotation via Tesseract OSD and write a corrected copy "
                          "to OUTPUT.pdf, then exit. Only the /Rotate flag is changed -- no pixel "
@@ -537,12 +561,40 @@ def main():
                 f"{[p for p, _, _ in unresolved]}")
         return
 
+    if args.slice:
+        if not args.output:
+            err("[pdf2md] ERROR: --slice requires -o OUTPUT.pdf")
+            sys.exit(2)
+        try:
+            a, b = (int(x) for x in args.slice.split("-", 1))
+            import fitz
+            src = fitz.open(args.input)
+            if not (1 <= a <= b <= len(src)):
+                err(f"[pdf2md] ERROR: --slice {args.slice} out of range (1-{len(src)})")
+                sys.exit(2)
+            dst = fitz.open()
+            dst.insert_pdf(src, from_page=a - 1, to_page=b - 1)
+            dst.save(args.output)
+            log(f"[pdf2md] --slice: wrote pages {a}-{b} -> {args.output}")
+        except SystemExit:
+            raise
+        except Exception as e:
+            err(f"[pdf2md] ERROR during --slice: {e}")
+            sys.exit(6)
+        return
+
     try:
-        pc, needs_ocr, total_chars, garbage_pages, image_pages = classify(
+        pc, needs_ocr, total_chars, garbage_pages, image_pages, per_page = classify(
             args.input, args.min_page_chars, args.garbage_char_ratio, args.image_coverage_threshold)
     except Exception as e:
         err(f"[pdf2md] ERROR opening/classifying PDF: {e}")
         sys.exit(2)
+
+    if args.classify_pages:
+        import json
+        print(json.dumps({"pages": pc, "total_chars": total_chars,
+                          "per_page": per_page}, indent=1))
+        return
 
     ratio = (len(needs_ocr) / pc) if pc else 1.0
     log(f"[pdf2md] {args.input}: {pc} pages, {len(needs_ocr)} need OCR "
