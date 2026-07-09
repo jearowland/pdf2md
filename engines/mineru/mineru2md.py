@@ -247,9 +247,10 @@ def insert_page_markers(md, content_list_json, log):
     return "".join(out), n_inserted
 
 
-def run_mineru(input_path, method, backend, lang, log, want_content_list=False, want_images=False):
+def run_mineru(input_path, method, backend, lang, log, want_content_list=False,
+                want_images=False, want_middle_json=False):
     """Run MinerU once with the given backend, return
-    (markdown, content_list_json_or_None, images_dict_or_None).
+    (markdown, content_list_json_or_None, images_dict_or_None, middle_json_or_None).
 
     MinerU's own layout model already computes exactly what a downstream
     reader needs for provenance -- page_idx and bbox per text/table block,
@@ -270,7 +271,18 @@ def run_mineru(input_path, method, backend, lang, log, want_content_list=False, 
     potentially figures/charts -- that pointed at files nowhere on disk,
     because this wrapper discarded the whole temp directory including them.
     A broken image reference for a chart would be silent data loss, not
-    just a cosmetic gap."""
+    just a cosmetic gap.
+
+    want_middle_json=True (added 2026-07-10) reads <stem>_middle.json, the
+    same discard-before-this-flag pattern as content_list_json above but
+    for MinerU's richer, hierarchical intermediate format rather than the
+    flattened one -- it carries a per-span `score` field (OCR/recognition
+    confidence) that content_list.json does not expose at all (confirmed
+    against MinerU's own published output-file reference before adding
+    this, not guessed from a sample). Exploratory use only for now: sizing
+    whether span-level confidence is a usable completeness/quality signal
+    for a downstream pipeline's own gating logic, not yet consumed by
+    anything in this repo."""
     t0 = time.time()
     with tempfile.TemporaryDirectory() as outdir:
         cmd = ["mineru", "-p", input_path, "-o", outdir, "-m", method, "-b", backend]
@@ -326,7 +338,19 @@ def run_mineru(input_path, method, backend, lang, log, want_content_list=False, 
                     log(f"[mineru2md] preserving {len(images)} image(s) referenced by the markdown "
                         f"(signatures, logos, and any figures/charts MinerU kept as images rather "
                         f"than extracting as text/tables)")
-        return md, content_list_json, images
+
+        middle_json = None
+        if want_middle_json:
+            mj_path = os.path.join(os.path.dirname(chosen), f"{stem}_middle.json")
+            if os.path.isfile(mj_path):
+                with open(mj_path, "r", encoding="utf-8") as f:
+                    middle_json = f.read()
+                log(f"[mineru2md] preserving {os.path.basename(mj_path)} "
+                    f"(hierarchical intermediate format, incl. per-span confidence scores)")
+            else:
+                log(f"[mineru2md] WARNING: expected {os.path.basename(mj_path)} not found -- "
+                    f"no confidence-score data will be saved for this document")
+        return md, content_list_json, images, middle_json
 
 
 _WORD_RE = re.compile(r"[A-Za-z]{5,}")
@@ -434,6 +458,13 @@ def main():
                          "real-word substitution of unusual proper nouns won't be corrected)")
     ap.add_argument("--reconcile-backend", default="pipeline",
                     help="backend used for the reference pass (default: pipeline)")
+    ap.add_argument("--middle-json", action="store_true",
+                    help="also preserve <stem>_middle.json (2026-07-10) -- MinerU's hierarchical "
+                         "intermediate format, carries a per-span confidence 'score' field that "
+                         "content_list.json does not expose. Exploratory: not consumed by anything "
+                         "in this repo yet, off by default (adds no runtime cost either way -- "
+                         "MinerU always writes this file, this flag only controls whether the "
+                         "wrapper preserves it before the temp directory is discarded).")
     ap.add_argument("--quiet", action="store_true", help="suppress stderr logs")
     args = ap.parse_args()
 
@@ -447,11 +478,12 @@ def main():
 
     t0 = time.time()
     log("[mineru2md] (first run lazy-downloads MinerU models to the mounted cache)")
-    md, content_list_json, images = run_mineru(args.input, args.method, args.backend, args.lang, log,
-                                                want_content_list=True, want_images=True)
+    md, content_list_json, images, middle_json = run_mineru(
+        args.input, args.method, args.backend, args.lang, log,
+        want_content_list=True, want_images=True, want_middle_json=args.middle_json)
 
     if args.reconcile and args.backend != args.reconcile_backend:
-        ref_md, _, _ = run_mineru(args.input, args.method, args.reconcile_backend, args.lang, log)
+        ref_md, _, _, _ = run_mineru(args.input, args.method, args.reconcile_backend, args.lang, log)
         md, _ = reconcile_spelling(md, ref_md, log)
         # content_list_json's page_idx/bbox geometry is unaffected by spelling
         # reconciliation (word-for-word text substitution only, layout untouched)
@@ -475,6 +507,11 @@ def main():
             with open(cl_out, "w", encoding="utf-8") as f:
                 f.write(content_list_json)
             log(f"[mineru2md] wrote {cl_out} (page_idx + bbox per block, for provenance)")
+        if middle_json:
+            mj_out = os.path.splitext(args.output)[0] + ".middle.json"
+            with open(mj_out, "w", encoding="utf-8") as f:
+                f.write(middle_json)
+            log(f"[mineru2md] wrote {mj_out} (hierarchical format, incl. per-span confidence)")
         if images:
             # Per-document subfolder (images/<stem>/), not one shared flat
             # images/ folder -- confirmed a real usability problem in a

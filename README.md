@@ -159,6 +159,13 @@ pdf2md-auto.sh              # main entrypoint: derotate -> classify -> route
 engines/
   text/                     # digital-PDF path: pymupdf4llm + classify + derotate (CPU)
   mineru/                   # scanned-PDF path: MinerU hybrid-engine + spelling reconciliation (GPU)
+  docling/                  # alternative engine, direct-call only (not yet in pdf2md-auto.sh's
+                             # routing or containerized — see docling2md.py's own docstring).
+                             # Evaluated 2026-07-10 on a 100-doc real-fixture sample: comparable
+                             # table structure, genuine Markdown pipe tables (not HTML), no
+                             # fabrication pattern found -- but 3 silent whole-statement-omission
+                             # cases in 100, no error raised. Same rule as the other two engines:
+                             # never trust unattended without a downstream completeness check.
 archive/
   marker-engine/            # retired OCR engine, kept for reference — see its README
   mineru-ab-testing/        # compare.sh, the Marker-vs-MinerU A/B harness (comparison settled)
