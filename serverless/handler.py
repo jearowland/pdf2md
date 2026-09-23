@@ -92,7 +92,8 @@ def convert(doc_path: str, engine: str | None, no_derotate: bool,
     classify = "forced"
     if engine not in ("text", "mineru"):
         proc = _run(PDF2MD + [src, "--classify-only"], log)
-        classify = proc.stdout.strip()
+        # verdict is the last line; tolerate stray library output above it
+        classify = (proc.stdout.strip().splitlines() or [""])[-1].strip()
         engine = {"digital": "text", "scan": "mineru"}.get(classify)
         if engine is None:
             raise RuntimeError(f"unexpected classify output: {classify!r}")

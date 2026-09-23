@@ -216,7 +216,7 @@ elif [ "$ROUTE" = "whole-doc" ]; then
   # Cheap classify: no GPU, no model load needed on this path.
   CLASS=$(docker run --rm -v "$DIR":/work --user "$(id -u):$(id -g)" -e HOME=/tmp \
     -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
-    pdf2md-text "/work/$BASE" --classify-only)
+    pdf2md-text "/work/$BASE" --classify-only | tail -n 1)   # verdict is the last line; tolerate stray library output above it
   case "$CLASS" in
     digital) ENGINE="text" ;;
     scan)    ENGINE="mineru" ;;

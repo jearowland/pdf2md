@@ -26,8 +26,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
-# Text engine python deps + the RunPod serverless SDK.
-RUN pip install --no-cache-dir pymupdf4llm pytesseract python-docx openpyxl runpod
+# Text engine python deps (the same pins as engines/text/Dockerfile -- keep
+# them in step; see the note there) + the RunPod serverless SDK (pinned to
+# the release current when the handler was written).
+RUN pip install --no-cache-dir \
+        pymupdf4llm==1.28.0 pymupdf==1.28.0 pymupdf_layout==1.28.0 tabulate==0.10.0 \
+        pytesseract==0.3.13 python-docx==1.2.0 openpyxl==3.1.5 runpod==1.10.0
 
 # The text engine's scripts, verbatim from engines/text -- same source of
 # truth as the per-engine images, nothing forked.

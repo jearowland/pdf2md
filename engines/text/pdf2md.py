@@ -182,8 +182,8 @@ def classify(pdf_path, min_page_chars, garbage_char_ratio=0.05, image_coverage_t
     strong, general, domain-agnostic signal that a page's true content is
     raster, not text, independent of whatever a coincidental text layer
     claims."""
-    import fitz  # PyMuPDF
-    doc = fitz.open(pdf_path)
+    import pymupdf
+    doc = pymupdf.open(pdf_path)
     needs_ocr, garbage_pages, image_pages, total_chars = [], [], [], 0
     per_page = []  # one fact-row per page, consumed by --classify-pages routing
     for i in range(len(doc)):
@@ -246,7 +246,7 @@ def detect_and_fix_rotation(pdf_path, output_path, dpi, min_confidence, log):
                     rotation was suspected but could not be verified
     """
     import io
-    import fitz
+    import pymupdf
     import pytesseract
     from PIL import Image
 
@@ -258,7 +258,7 @@ def detect_and_fix_rotation(pdf_path, output_path, dpi, min_confidence, log):
         except pytesseract.TesseractError:
             return None  # no text detected (blank/logo-only page) -- nothing to orient against
 
-    doc = fitz.open(pdf_path)
+    doc = pymupdf.open(pdf_path)
     fixed, unresolved = [], []
     for i in range(len(doc)):
         page = doc[i]
@@ -431,10 +431,10 @@ def to_markdown_text(pdf_path):
     concern; matching which heading text means which target statement stays
     in the downstream pipeline that actually knows what it's looking for.
     """
-    import fitz
+    import pymupdf
     import pymupdf4llm
     chunks = pymupdf4llm.to_markdown(pdf_path, use_ocr=False, page_chunks=True)
-    plain_doc = fitz.open(pdf_path)  # second, independent tokenisation -- see repair_merged_spacing()
+    plain_doc = pymupdf.open(pdf_path)  # second, independent tokenisation -- see repair_merged_spacing()
 
     parts = []
     page_boxes = []
@@ -567,12 +567,12 @@ def main():
             sys.exit(2)
         try:
             a, b = (int(x) for x in args.slice.split("-", 1))
-            import fitz
-            src = fitz.open(args.input)
+            import pymupdf
+            src = pymupdf.open(args.input)
             if not (1 <= a <= b <= len(src)):
                 err(f"[pdf2md] ERROR: --slice {args.slice} out of range (1-{len(src)})")
                 sys.exit(2)
-            dst = fitz.open()
+            dst = pymupdf.open()
             dst.insert_pdf(src, from_page=a - 1, to_page=b - 1)
             dst.save(args.output)
             log(f"[pdf2md] --slice: wrote pages {a}-{b} -> {args.output}")

@@ -110,6 +110,13 @@ A private registry works too, and doubles as the source for the serverless image
 `pdf2md-text` and `pdf2md-mineru` are cheap, so rebuild those on each worker after every
 checkout (see the second item under "must not happen").
 
+**`pdf2md-text` must be pinned too, not just MinerU.** Every `pip install` in
+`engines/text/Dockerfile` (and the matching line in `serverless/Dockerfile`) carries an
+exact version. Rebuilding it on each worker is only safe because those versions cannot drift.
+An unpinned fresh build once picked up a PyMuPDF release that prints a deprecation warning to
+stdout, and that broke every per-page-routed conversion on the new host while older images
+kept working. Bump the pins deliberately and together, then rerun the smoke test below.
+
 The build needs disk headroom well beyond the final 43GB for intermediate layers. Check
 `docker system df` before assuming a failed build was anything other than a full disk.
 
@@ -264,7 +271,7 @@ spot.
 mkdir -p ~/pdf2md-smoke && cd ~/pdf2md-smoke
 docker run --rm -i -v "$PWD":/work --user "$(id -u):$(id -g)" -e HOME=/tmp \
   --entrypoint python3 pdf2md-text - <<'EOF'
-import fitz
+import pymupdf
 def page(doc, title, rows):
     p = doc.new_page(width=595, height=842)
     p.insert_text((72, 90), title, fontsize=16)
@@ -272,12 +279,12 @@ def page(doc, title, rows):
         y = 130 + 22 * i
         p.insert_text((72, y), k, fontsize=12)
         p.insert_text((380, y), v, fontsize=12)
-out = fitz.open()
+out = pymupdf.open()
 page(out, "Smoke test: digital page", [("Alpha", "1,234,567"), ("Beta", "987,654"), ("Total", "2,222,221")])
-src = fitz.open()
+src = pymupdf.open()
 page(src, "Smoke test: scanned page", [("Gamma", "3,456,789"), ("Delta", "1,112,131"), ("Total", "4,568,920")])
 out.new_page(width=595, height=842).insert_image(
-    fitz.Rect(0, 0, 595, 842), pixmap=src[0].get_pixmap(dpi=200))
+    pymupdf.Rect(0, 0, 595, 842), pixmap=src[0].get_pixmap(dpi=200))
 out.save("smoke.pdf")
 EOF
 ```

@@ -28,7 +28,16 @@ ENV PYTHONUNBUFFERED=1
 # python-docx / openpyxl are pure structural readers for docx2md.py /
 # xlsx2md.py -- no OCR, no model weights, same CPU-only profile as the PDF
 # path, so they share this image rather than needing one of their own.
-RUN pip install --no-cache-dir pymupdf4llm pytesseract python-docx openpyxl
+#
+# Every version is PINNED, transitive PyMuPDF packages included. Unpinned,
+# a fresh build picked up PyMuPDF 1.28.2, whose `import fitz` prints a
+# deprecation warning to STDOUT -- which corrupted --classify-pages' JSON
+# and broke every per-page-routed conversion, while older images kept
+# working. Bump these deliberately, together, and rerun MIGRATION.md's
+# smoke test before trusting the new image.
+RUN pip install --no-cache-dir \
+        pymupdf4llm==1.28.0 pymupdf==1.28.0 pymupdf_layout==1.28.0 tabulate==0.10.0 \
+        pytesseract==0.3.13 python-docx==1.2.0 openpyxl==3.1.5
 
 WORKDIR /work
 COPY pdf2md.py /usr/local/bin/pdf2md.py

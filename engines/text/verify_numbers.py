@@ -49,7 +49,7 @@ import json
 import re
 import sys
 
-import fitz  # PyMuPDF
+import pymupdf
 
 # money-like: comma-grouped with >= 4 significant digits ("1,234",
 # "12,345,678") — the formatting financial statements actually use.
@@ -75,7 +75,7 @@ def main() -> None:
     with open(args.md, encoding="utf-8", errors="replace") as f:
         md_numbers = money_numbers(f.read())
 
-    doc = fitz.open(args.pdf)
+    doc = pymupdf.open(args.pdf)
     page_numbers: dict[int, set[str]] = {}
     for i, page in enumerate(doc, start=1):
         nums = money_numbers(page.get_text())

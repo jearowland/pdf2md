@@ -95,6 +95,20 @@ def _gid():
     return os.getgid()
 
 
+def parse_json_report(stdout: str) -> dict:
+    """Parse the container's JSON report, tolerating stray lines around it.
+    A library warning printed to stdout (a deprecation notice on import, say)
+    must not break routing; the skipped text is echoed to stderr, not hidden."""
+    start = stdout.find("{")
+    if start < 0:
+        raise SystemExit(f"[route] ERROR: no JSON in classifier output: {stdout[:300]!r}")
+    report, end = json.JSONDecoder().raw_decode(stdout, start)
+    stray = (stdout[:start] + stdout[end:]).strip()
+    if stray:
+        err(f"[route] ignored non-JSON classifier stdout: {stray[:300]!r}")
+    return report
+
+
 def plan_runs(per_page: list[dict], whole_doc_ocr_ratio: float,
               max_runs: int) -> list[tuple[int, int, str]]:
     """Contiguous same-class runs [(first_page, last_page, engine)].
@@ -180,7 +194,7 @@ def main():
     # 2. per-page classification (facts only)
     r = docker_text(workdir, [f"/work/{pdf.name}", "--classify-pages", "--quiet"],
                     args.dev_bind, capture=True)
-    report = json.loads(r.stdout)
+    report = parse_json_report(r.stdout)
     per_page, pc = report["per_page"], report["pages"]
 
     # 3. plan
