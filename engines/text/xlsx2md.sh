@@ -9,6 +9,7 @@
 #
 # The input file's directory is mounted as /work, so -o paths are relative to it.
 set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/../docker-user.sh"   # DOCKER_USER: --user on rootful Docker, none on rootless
 
 if [ $# -lt 1 ]; then
   echo "usage: $0 INPUT.xlsx [xlsx2md args...]" >&2
@@ -23,7 +24,7 @@ BASE="$(basename "$IN")"
 
 exec docker run --rm \
   --entrypoint python \
-  --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  "${DOCKER_USER[@]}" -e HOME=/tmp \
   -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
   -v "$DIR":/work \
   pdf2md-text /usr/local/bin/xlsx2md.py "/work/$BASE" "$@"

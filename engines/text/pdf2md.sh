@@ -9,6 +9,7 @@
 #
 # The input PDF's directory is mounted as /work, so -o paths are relative to it.
 set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/../docker-user.sh"   # DOCKER_USER: --user on rootful Docker, none on rootless
 
 if [ $# -lt 1 ]; then
   echo "usage: $0 INPUT.pdf [pdf2md args...]" >&2
@@ -22,7 +23,7 @@ DIR="$(cd "$(dirname "$IN")" && pwd)"
 BASE="$(basename "$IN")"
 
 exec docker run --rm \
-  --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  "${DOCKER_USER[@]}" -e HOME=/tmp \
   -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
   -v "$DIR":/work \
   pdf2md-text "/work/$BASE" "$@"

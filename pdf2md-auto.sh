@@ -74,6 +74,7 @@
 #
 # Point TEXT_DIR / MINERU_DIR at wherever those engine folders live.
 set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/engines/docker-user.sh"   # DOCKER_USER: --user on rootful Docker, none on rootless
 
 # Mirror all output to a stable log path (in addition to normal stdout/stderr) so
 # `tail -f ~/pdf2md/logs/pdf2md-auto.log` keeps working across runs/sessions
@@ -151,7 +152,7 @@ if [ "$EXT" = "doc" ] || [ "$EXT" = "xls" ]; then
   CONVERTED="$STEM.from${EXT}.pdf"
   echo "[pdf2md-auto] .$EXT input -> converting to PDF via LibreOffice first ($CONVERTED)..." >&2
   docker run --rm -v "$DIR":/work --entrypoint bash \
-    --user "$(id -u):$(id -g)" -e HOME=/tmp \
+    "${DOCKER_USER[@]}" -e HOME=/tmp \
     -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
     pdf2md-text -c \
     "mkdir -p /work/.libreoffice-tmp && soffice --headless --convert-to pdf --outdir /work/.libreoffice-tmp '/work/$BASE' && mv '/work/.libreoffice-tmp/$STEM.pdf' '/work/$CONVERTED' && rmdir /work/.libreoffice-tmp"
@@ -169,7 +170,7 @@ fi
 
 if [ -z "$SKIP_DEROTATE" ]; then
   echo "[pdf2md-auto] checking page rotation..." >&2
-  docker run --rm -v "$DIR":/work --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  docker run --rm -v "$DIR":/work "${DOCKER_USER[@]}" -e HOME=/tmp \
     -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
     pdf2md-text "/work/$BASE" --derotate "/work/$STEM.derotated.pdf"
   BASE="$STEM.derotated.pdf"
@@ -214,7 +215,7 @@ elif [ -n "$FORCE_ENGINE" ]; then
   echo "[pdf2md-auto] forced engine: $ENGINE (whole-document)" >&2
 elif [ "$ROUTE" = "whole-doc" ]; then
   # Cheap classify: no GPU, no model load needed on this path.
-  CLASS=$(docker run --rm -v "$DIR":/work --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  CLASS=$(docker run --rm -v "$DIR":/work "${DOCKER_USER[@]}" -e HOME=/tmp \
     -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
     pdf2md-text "/work/$BASE" --classify-only | tail -n 1)   # verdict is the last line; tolerate stray library output above it
   case "$CLASS" in
@@ -248,7 +249,7 @@ run_and_verify() {
   case "$OUT_MD" in /*) : ;; ?*) OUT_MD="$DIR/$OUT_MD" ;; esac
   if [ $rc -eq 0 ] && [ -n "$OUT_MD" ] && [ -f "$OUT_MD" ]; then
     local odir; odir=$(cd "$(dirname "$OUT_MD")" && pwd)
-    docker run --rm -v "$DIR":/work -v "$odir":/out --user "$(id -u):$(id -g)"       -e HOME=/tmp -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro       --entrypoint python3 pdf2md-text /usr/local/bin/verify_numbers.py       "/work/$BASE" "/out/$(basename "$OUT_MD")" || true
+    docker run --rm -v "$DIR":/work -v "$odir":/out "${DOCKER_USER[@]}"       -e HOME=/tmp -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro       --entrypoint python3 pdf2md-text /usr/local/bin/verify_numbers.py       "/work/$BASE" "/out/$(basename "$OUT_MD")" || true
   fi
   return $rc
 }
