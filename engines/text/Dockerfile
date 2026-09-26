@@ -43,6 +43,7 @@ WORKDIR /work
 COPY pdf2md.py /usr/local/bin/pdf2md.py
 COPY common.py /usr/local/bin/common.py
 COPY verify_numbers.py /usr/local/bin/verify_numbers.py
+COPY verify_text.py /usr/local/bin/verify_text.py
 COPY docx2md.py /usr/local/bin/docx2md.py
 COPY xlsx2md.py /usr/local/bin/xlsx2md.py
 ENTRYPOINT ["python", "/usr/local/bin/pdf2md.py"]

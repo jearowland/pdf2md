@@ -138,22 +138,100 @@ def quiet_stdout():
         os.close(saved)
 
 
+# A background image is one with VISIBLE text drawn on top of it at a density
+# of at least this many chars per full page of image area (and at least
+# BACKGROUND_MIN_CHARS in absolute terms). A normal page of body text is
+# ~2,000 chars, so 500 means "a quarter of a normal page's text density".
+# The thresholds only need to separate two very different shapes: designed
+# pages (text set over a photo or tinted panel: every day box of a grid flyer
+# sits on a background strip) from scans with a few visible words stamped on
+# top (a Bates number, a "page 3 of 10" footer) -- tens of chars over a
+# full-page image, which stays well under both.
+BACKGROUND_MIN_CHARS_PER_PAGE_AREA = 500
+BACKGROUND_MIN_CHARS = 20
+
+
+def _drawing_facts(page):
+    """(images, text_spans) in drawing order, as plain Python values:
+    images [(Rect, seqno)] for every fill-image command, text_spans
+    [(seqno, visible, centre, nonspace_chars)] for every text span.
+
+    PyMuPDF 1.28.x's get_bboxlog() and get_texttrace() drop a reference to
+    None on every call (measured: about a thousand per 28-page document for
+    each, still present in 1.28.2). On Python 3.11, where None is not
+    immortal, that frees None after a few thousand pages in one process and
+    the interpreter aborts ("none_dealloc") -- confirmed on the fourth PDF
+    of a corpus run. So copy out what we need, drop PyMuPDF's objects, and
+    give back whatever references the calls took. Over-restoring only keeps
+    None alive, which it always is; under-restoring is the crash. Remove
+    this once the image runs a fixed PyMuPDF or Python 3.12+."""
+    import ctypes
+    import pymupdf
+    before = sys.getrefcount(None)
+    log = page.get_bboxlog()
+    images = [(pymupdf.Rect(b), i) for i, (kind, b) in enumerate(log)
+              if kind == "fill-image"]
+    trace = page.get_texttrace()
+    # render mode 3 is invisible text: the search-index OCR layer of a scan
+    # or a pasted screenshot sits over the image but isn't what a reader sees
+    spans = [(s["seqno"], s["type"] != 3 and s["opacity"] > 0,
+              ((s["bbox"][0] + s["bbox"][2]) / 2, (s["bbox"][1] + s["bbox"][3]) / 2),
+              sum(1 for c in s["chars"] if not chr(c[0]).isspace()))
+             for s in trace]
+    del log, trace
+    for _ in range(max(before - sys.getrefcount(None), 0)):
+        ctypes.pythonapi.Py_IncRef(ctypes.py_object(None))
+    return images, spans
+
+
+def _visible_chars_over(spans, rect, seqno):
+    """Chars of visible text drawn AFTER drawing command `seqno` with the
+    span's centre inside `rect`. Text drawn before the image is underneath
+    it and hidden, so it doesn't count; nor does invisible text."""
+    return sum(n for sq, visible, centre, n in spans
+               if visible and sq > seqno and rect.contains(centre))
+
+
 def _page_image_coverage(page):
-    """Fraction of the page's area covered by embedded images, using their
-    PLACED rects (post-transform, clipped to the page) -- not native pixel
-    size, since what matters is how much of the visible page an image
-    occupies, not its resolution. Overlapping images are double-counted
+    """(coverage, background_coverage): the fraction of the page's area
+    covered by embedded images, using their PLACED rects (post-transform,
+    clipped to the page) -- not native pixel size, since what matters is how
+    much of the visible page an image occupies, not its resolution -- and
+    how much of that is BACKGROUND (see BACKGROUND_MIN_CHARS_PER_PAGE_AREA):
+    images with enough visible text drawn over them that the text, not the
+    image, is the page's content. Overlapping images are double-counted
     (rare in practice, not worth the complexity of proper union area) and
-    the result is clamped to 1.0."""
+    both results are clamped to 1.0.
+
+    Background images are reported apart so image_page ignores them.
+    Confirmed failure without this: a one-page grid flyer (ten day boxes of
+    visible text over a background photo stored as six full-width strips)
+    measured 67.5% image coverage, routed to MinerU despite a complete text
+    layer, and MinerU silently dropped 4 of the 10 boxes and the title."""
     page_area = page.rect.width * page.rect.height
     if page_area <= 0:
-        return 0.0
-    covered = 0.0
+        return 0.0, 0.0
+    # each placed image's drawing-sequence number, to tell text drawn over it
+    # from text underneath it; texttrace seqnos index the same sequence
+    image_seqnos, spans = _drawing_facts(page)
+    covered = background = 0.0
     for img in page.get_images(full=True):
         for rect in page.get_image_rects(img[0]):
             clipped = rect & page.rect
-            covered += clipped.width * clipped.height
-    return min(covered / page_area, 1.0)
+            area = clipped.width * clipped.height
+            covered += area
+            # no matching draw command (shouldn't happen): count it as a
+            # plain image -- the pre-existing, OCR-leaning behaviour
+            seqno = next((i for r, i in image_seqnos
+                          if abs(r.x0 - rect.x0) < 1 and abs(r.y0 - rect.y0) < 1
+                          and abs(r.x1 - rect.x1) < 1 and abs(r.y1 - rect.y1) < 1), None)
+            if seqno is None or area <= 0:
+                continue
+            chars = _visible_chars_over(spans, clipped, seqno)
+            if chars >= max(BACKGROUND_MIN_CHARS,
+                            BACKGROUND_MIN_CHARS_PER_PAGE_AREA * area / page_area):
+                background += area
+    return min(covered / page_area, 1.0), min(background / page_area, 1.0)
 
 
 def classify(pdf_path, min_page_chars, garbage_char_ratio=0.05, image_coverage_threshold=0.5):
@@ -191,7 +269,7 @@ def classify(pdf_path, min_page_chars, garbage_char_ratio=0.05, image_coverage_t
         txt = page.get_text("text")
         n = len(txt.strip())
         total_chars += n
-        cov = _page_image_coverage(page)
+        cov, bg_cov = _page_image_coverage(page)
         reasons = []
         if n < min_page_chars:
             reasons.append("low_text")
@@ -199,10 +277,11 @@ def classify(pdf_path, min_page_chars, garbage_char_ratio=0.05, image_coverage_t
             garbage_ratio = len(CONTROL_CHAR_RE.findall(txt)) / max(len(txt), 1)
             if garbage_ratio > garbage_char_ratio:
                 reasons.append("garbage_text")
-            if cov > image_coverage_threshold:
+            if cov - bg_cov > image_coverage_threshold:
                 reasons.append("image_page")
         per_page.append({"page": i + 1, "text_chars": n,
                          "image_coverage": round(cov, 3),
+                         "background_image_coverage": round(bg_cov, 3),
                          "class": "ocr" if reasons else "text",
                          "reasons": reasons})
         if reasons:
@@ -495,8 +574,9 @@ def main():
     ap.add_argument("--min-page-chars", type=int, default=20,
                     help="a page with fewer stripped chars counts as image-only (default 20)")
     ap.add_argument("--image-coverage-threshold", type=float, default=0.5,
-                    help="a page more than this fraction covered by a single embedded image "
-                         "counts as needing OCR too, regardless of its text layer -- confirmed a "
+                    help="a page more than this fraction covered by embedded images counts "
+                         "as needing OCR too, regardless of its text layer (background images, "
+                         "with enough visible text drawn over them, excluded) -- confirmed a "
                          "real case (a pasted screenshot of a financial table, rotated, with an "
                          "auto-generated column-major OCR text layer that passed every other "
                          "check while being structurally unusable) (default 0.5)")

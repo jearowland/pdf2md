@@ -54,7 +54,7 @@ account.
 
 ## Known defects, and how each is handled
 
-Three distinct silent-failure classes were found and fixed during validation.
+Four distinct silent-failure classes were found and fixed during validation.
 Each needed a different kind of fix — worth understanding before touching
 this code, since a fix for one class does not generalise to another.
 
@@ -115,6 +115,43 @@ substitutions like `"Reliabilty"`/`"Reliability"` actually represent.
 On by default; skip with `--no-reconcile-spelling` (roughly doubles MinerU's
 per-document runtime — the reference pass costs about 40s on top of
 `hybrid-engine`'s ~85s).
+
+### 4. Whole blocks dropped on a designed page sent to OCR (layout)
+A one-page grid flyer (ten day boxes of visible text set over a background
+photo) has a complete text layer, but its background image covered 67.5% of
+the page, so the `image_page` rule sent it to MinerU. MinerU emitted six of
+the ten boxes, lost the title, and said nothing. Docling kept only the footer.
+
+Two fixes, each general:
+
+- **Background images don't make an image page.** An image with enough
+  *visible* text drawn *over* it (by drawing order, from PyMuPDF's
+  `get_bboxlog()`/`get_texttrace()`) is background: the text is the content.
+  Invisible text (render mode 3, the OCR layer of a scan or a pasted
+  screenshot) and text underneath the image don't count, so the case
+  `image_page` exists for still routes to OCR. The page reports
+  `background_image_coverage` beside `image_coverage`. On a sample of 800
+  real annual reports, every page this changed was a designed page or a
+  letter on full-page letterhead, and none was a scan or a pasted table.
+- **Content-loss check** (`engines/text/verify_text.py`): per page, the share
+  of the text layer's words the output kept (the page and its neighbours, so
+  a block moved across a page break doesn't count as lost). Below 80%, the
+  manifest gets a `text_layer_content_missing` warning with a sample of the
+  missing words. It is report-only, like `verify_numbers`. On the flyer,
+  MinerU scores 59%, Docling 6% and the text engine 92%.
+
+## Regression testing
+
+`tools/uat.py` re-checks every verified fix against a **private** case list
+(JSONL, kept beside the documents and never in this repo; the format is in
+the script's docstring). Run the routing-only tier on core after any
+classifier or routing change, and the full tier on a GPU worker before
+merging:
+
+```bash
+tools/uat.py CASES.jsonl --classify-only --dev-bind       # seconds per document, CPU
+gpu run --kind convert --needs docker -- tools/uat.py CASES.jsonl --remote '$GPU_HOST'
+```
 
 ## Setup
 

@@ -29,7 +29,8 @@ Flow (each step is one of the same containers pdf2md-auto.sh already uses):
                           host-wide GPU flock)
   5. merge               (page markers renumbered to GLOBAL page numbers)
   6. manifest            (<out>.manifest.json -- per-page FACTS + intrinsic
-                          warnings only; see below)
+                          warnings only; see below), including verify_text's
+                          per-page text-layer recall
   7. verify_numbers      (unchanged, report-only)
 
 Fast paths: all pages one class -> exactly today's behaviour, one engine,
@@ -38,9 +39,12 @@ no slicing. OCR share above --whole-doc-ocr-ratio -> whole-document MinerU
 
 The manifest is deliberately OPINION-FREE. It records what happened
 (per-page class, engine used, text chars, image coverage, emitted table
-rows) plus only two warnings that are intrinsic to ALL PDFs regardless of
-domain: (a) the merged output does not reach the final page, (b) a page
-with a healthy text layer emitted nothing. Judgments like "this document
+rows, text-layer recall) plus only warnings that are intrinsic to ALL PDFs
+regardless of domain: (a) the merged output does not reach the final page
+(kind output_ends_early), (b) a page with a healthy text layer emitted
+nothing (text_page_empty_output), (c) a page's output kept too little of its
+text layer's wording (text_layer_content_missing -- the engine dropped
+blocks; see engines/text/verify_text.py). Judgments like "this document
 should contain tables" belong to callers, who know what kind of document
 they gave us -- this tool does not.
 
@@ -63,6 +67,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 MINERU_SH = REPO / "engines" / "mineru" / "mineru.sh"
 PAGE_MARKER_RE = re.compile(r"<!-- page (\d+) -->")
+WHOLE_DOC_OCR_RATIO = 0.8   # see plan_runs
+MAX_RUNS = 24
 
 
 def err(*a):
@@ -70,19 +76,39 @@ def err(*a):
 
 
 def docker_text(workdir: Path, argv: list[str], dev_bind: bool,
-                capture: bool = False):
+                capture: bool = False, entrypoint: str | None = None):
     """Run the pdf2md-text container exactly the way pdf2md.sh does
     (input dir mounted as /work, caller uid/gid), optionally overlaying the
     local pdf2md.py for pre-rebuild testing."""
-    cmd = ["docker", "run", "--rm",
-           "--user", f"{_uid()}:{_gid()}", "-e", "HOME=/tmp",
+    cmd = ["docker", "run", "--rm", *docker_user(), "-e", "HOME=/tmp",
            "-v", "/etc/passwd:/etc/passwd:ro", "-v", "/etc/group:/etc/group:ro",
            "-v", f"{workdir}:/work"]
     if dev_bind:
-        cmd += ["-v", f"{REPO/'engines/text/pdf2md.py'}:/usr/local/bin/pdf2md.py:ro"]
+        cmd += ["-v", f"{REPO/'engines/text/pdf2md.py'}:/usr/local/bin/pdf2md.py:ro",
+                "-v", f"{REPO/'engines/text/verify_text.py'}:/usr/local/bin/verify_text.py:ro"]
+    if entrypoint:
+        cmd += ["--entrypoint", entrypoint]
     cmd += ["pdf2md-text"] + argv
     return subprocess.run(cmd, check=True, text=True,
                           capture_output=capture)
+
+
+_DOCKER_USER: list[str] | None = None
+
+
+def docker_user() -> list[str]:
+    """The run's user mapping, as engines/docker-user.sh sets it: --user
+    uid:gid under rootful Docker (the GPU workers) so output files stay the
+    caller's; nothing under rootless Docker (core), where the container's
+    root already IS the caller and --user maps to an unrelated subordinate
+    uid that can't write the output folder."""
+    global _DOCKER_USER
+    if _DOCKER_USER is None:
+        info = subprocess.run(["docker", "info", "--format", "{{.SecurityOptions}}"],
+                              capture_output=True, text=True)
+        _DOCKER_USER = [] if "rootless" in info.stdout \
+            else ["--user", f"{_uid()}:{_gid()}"]
+    return _DOCKER_USER
 
 
 def _uid():
@@ -166,8 +192,8 @@ def main():
     ap.add_argument("-o", "--output", required=True,
                     help="output markdown path (manifest lands beside it)")
     ap.add_argument("--no-derotate", action="store_true")
-    ap.add_argument("--whole-doc-ocr-ratio", type=float, default=0.8)
-    ap.add_argument("--max-runs", type=int, default=24)
+    ap.add_argument("--whole-doc-ocr-ratio", type=float, default=WHOLE_DOC_OCR_RATIO)
+    ap.add_argument("--max-runs", type=int, default=MAX_RUNS)
     ap.add_argument("--keep-parts", action="store_true",
                     help="keep per-run slice PDFs and chunk markdowns")
     ap.add_argument("--dev-bind", action="store_true",
@@ -263,6 +289,22 @@ def main():
                              "detail": f"text layer has {p['text_chars']} chars "
                                        f"but output segment is near-empty"})
 
+    # content-loss check: per page, how much of the text layer's wording the
+    # output kept (engines/text/verify_text.py). Report-only, like
+    # verify_numbers: a failure to check never fails the conversion.
+    recall_by_page: dict[int, float | None] = {}
+    try:
+        r = docker_text(workdir, ["/usr/local/bin/verify_text.py",
+                                  f"/work/{pdf.name}", f"/work/{out_md.name}", "--json"],
+                        args.dev_bind, capture=True, entrypoint="python3")
+        vt = parse_json_report(r.stdout)
+        recall_by_page = {p["page"]: p["recall"] for p in vt["per_page"]}
+        warnings.extend(vt["warnings"])
+        for w in vt["warnings"]:
+            err(f"[route] WARNING page {w['page']}: {w['detail']}")
+    except Exception as e:
+        err(f"[route] text-coverage check did not run: {e}")
+
     manifest = {
         "source": str(Path(args.input).name),
         "pdf_pages": pc,
@@ -270,7 +312,8 @@ def main():
         "per_page": [{**p, "engine": next(e for a, b, e in runs
                                           if a <= p["page"] <= b),
                       "table_rows_emitted": rows.get(p["page"], 0),
-                      "output_chars": seg_chars.get(p["page"], 0)}
+                      "output_chars": seg_chars.get(p["page"], 0),
+                      "text_layer_recall": recall_by_page.get(p["page"])}
                      for p in per_page],
         "warnings": warnings,
     }
@@ -280,7 +323,7 @@ def main():
     # 7. number-preservation check (unchanged from auto.sh, report-only)
     try:
         subprocess.run(["docker", "run", "--rm", "-v", f"{workdir}:/work",
-                        "--user", f"{_uid()}:{_gid()}", "-e", "HOME=/tmp",
+                        *docker_user(), "-e", "HOME=/tmp",
                         "-v", "/etc/passwd:/etc/passwd:ro",
                         "-v", "/etc/group:/etc/group:ro",
                         "--entrypoint", "python3", "pdf2md-text",

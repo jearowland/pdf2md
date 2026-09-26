@@ -250,6 +250,10 @@ run_and_verify() {
   if [ $rc -eq 0 ] && [ -n "$OUT_MD" ] && [ -f "$OUT_MD" ]; then
     local odir; odir=$(cd "$(dirname "$OUT_MD")" && pwd)
     docker run --rm -v "$DIR":/work -v "$odir":/out "${DOCKER_USER[@]}"       -e HOME=/tmp -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro       --entrypoint python3 pdf2md-text /usr/local/bin/verify_numbers.py       "/work/$BASE" "/out/$(basename "$OUT_MD")" || true
+    docker run --rm -v "$DIR":/work -v "$odir":/out "${DOCKER_USER[@]}" \
+      -e HOME=/tmp -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+      --entrypoint python3 pdf2md-text /usr/local/bin/verify_text.py \
+      "/work/$BASE" "/out/$(basename "$OUT_MD")" || true
   fi
   return $rc
 }
