@@ -36,7 +36,7 @@ ENV PYTHONUNBUFFERED=1
 # working. Bump these deliberately, together, and rerun MIGRATION.md's
 # smoke test before trusting the new image.
 RUN pip install --no-cache-dir \
-        pymupdf4llm==1.28.0 pymupdf==1.28.0 pymupdf_layout==1.28.0 tabulate==0.10.0 \
+        pymupdf4llm==1.28.0 pymupdf==1.28.0 pymupdf_layout==1.28.0 tabulate==0.10.0 fonttools==4.66.0 \
         pytesseract==0.3.13 python-docx==1.2.0 openpyxl==3.1.5
 
 WORKDIR /work

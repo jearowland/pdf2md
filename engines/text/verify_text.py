@@ -3,14 +3,18 @@
 verify_text.py — post-conversion completeness check: did the markdown keep
 the WORDS each PDF page's text layer contains?
 
-Motivation: a layout engine can drop whole blocks of a page and say nothing.
-Confirmed on a one-page grid flyer with a complete text layer: MinerU emitted
-6 of its 10 day boxes and lost the title, with no error and nothing in the
-output to show anything was missing. verify_numbers can't see that kind of
-loss (there are no money-like numbers in prose); this check can. It matters
+Motivation: a layout engine can drop whole blocks of a page and say nothing
+(verify_numbers found this in tables; on a designed flyer MinerU lost the
+page title, white text on a coloured band). verify_numbers can't see a loss
+with no money-like numbers in it; this check can. It matters
 most on pages that go to OCR despite having a healthy text layer (an image
 page, a designed page over a background photo), since there the engine
 ignores a perfect reference that we still have.
+
+The reference must be the text a reader can SEE: run it on the PDF after
+pdf2md.py --prepare (the router does), or text hidden under a
+cosmetic redaction counts as "missing" from an output that rightly left it
+out -- exactly what happened on that flyer before covered text was removed.
 
 Method: per page, the multiset of words (letters only, 3+ chars, Unicode
 NFKC, case-folded) in the text layer is the reference. Recall is the share

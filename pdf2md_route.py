@@ -22,6 +22,9 @@ The unit of failure is the page, so the unit of routing must be the page.
 Flow (each step is one of the same containers pdf2md-auto.sh already uses):
 
   1. derotate            (unchanged, whole file -- geometry only)
+  1b. --prepare          (text hidden under opaque rectangles removed, the
+                          page rendering as before; ligature glyphs given
+                          their text back from the font's own tables)
   2. --classify-pages    (per-page fact rows: class text|ocr + reasons)
   3. plan runs           (contiguous same-class page runs; fast paths below)
   4. --slice + convert   (each run through its engine; MinerU calls go via
@@ -44,7 +47,9 @@ regardless of domain: (a) the merged output does not reach the final page
 (kind output_ends_early), (b) a page with a healthy text layer emitted
 nothing (text_page_empty_output), (c) a page's output kept too little of its
 text layer's wording (text_layer_content_missing -- the engine dropped
-blocks; see engines/text/verify_text.py). Judgments like "this document
+blocks; see engines/text/verify_text.py), (d) text hidden under opaque
+shapes was removed before conversion (covered_text_removed -- a cosmetic
+redaction, or text under a panel). Judgments like "this document
 should contain tables" belong to callers, who know what kind of document
 they gave us -- this tool does not.
 
@@ -217,6 +222,22 @@ def main():
                               f"/work/{stem}.derotated.pdf"], args.dev_bind)
         pdf = workdir / f"{stem}.derotated.pdf"
 
+    # 1b. the copy every engine converts: text hidden under opaque rectangles
+    # (cosmetic redactions, text under a panel) removed -- an OCR engine reads
+    # only what renders, a text-layer engine would read it all -- and ligature
+    # glyphs given their text back. See pdf2md.py's prepare_pdf. A document
+    # needing neither is copied byte for byte.
+    r = docker_text(workdir, [f"/work/{pdf.name}", "--prepare",
+                              f"/work/{stem}.prepared.pdf", "--quiet"],
+                    args.dev_bind, capture=True)
+    prepared = parse_json_report(r.stdout)
+    covered = {c["page"]: c for c in prepared["pages"]}
+    pdf = workdir / f"{stem}.prepared.pdf"
+    if covered:
+        err(f"[route] removed text hidden under opaque shapes on page(s) {sorted(covered)}")
+    for f in prepared["ligature_fixes"]:
+        err(f"[route] font {f['font']}: {len(f['glyphs'])} ligature glyph(s) given their text back")
+
     # 2. per-page classification (facts only)
     r = docker_text(workdir, [f"/work/{pdf.name}", "--classify-pages", "--quiet"],
                     args.dev_bind, capture=True)
@@ -289,6 +310,15 @@ def main():
                              "detail": f"text layer has {p['text_chars']} chars "
                                        f"but output segment is near-empty"})
 
+    for c in covered.values():
+        warnings.append({"kind": "covered_text_removed", "page": c["page"],
+                         "covered_chars": c["covered_chars"],
+                         "redaction_markers": c["redaction_markers"],
+                         "detail": f"{c['covered_chars']} chars of text hidden under opaque "
+                                   f"shapes were removed (cosmetic redaction or text under a "
+                                   f"panel); {c['redaction_markers']} block(s) under dark "
+                                   f"fills are marked [redacted] in the output"})
+
     # content-loss check: per page, how much of the text layer's wording the
     # output kept (engines/text/verify_text.py). Report-only, like
     # verify_numbers: a failure to check never fails the conversion.
@@ -313,8 +343,10 @@ def main():
                                           if a <= p["page"] <= b),
                       "table_rows_emitted": rows.get(p["page"], 0),
                       "output_chars": seg_chars.get(p["page"], 0),
-                      "text_layer_recall": recall_by_page.get(p["page"])}
+                      "text_layer_recall": recall_by_page.get(p["page"]),
+                      "covered_text_chars": covered.get(p["page"], {}).get("covered_chars", 0)}
                      for p in per_page],
+        "ligature_fixes": prepared["ligature_fixes"],
         "warnings": warnings,
     }
     man_path = out_md.with_suffix(".manifest.json")

@@ -61,6 +61,49 @@ def _letters_only(s):
     return re.sub(r"[^A-Za-z]", "", s).upper()
 
 
+# Letter sequences fonts commonly draw as one ligature glyph.
+LIGATURE_SEQUENCES = ("ffi", "ffl", "tti", "ff", "fi", "fl", "fj", "ft", "st", "ct", "ch",
+                      "ti", "tt", "th")
+WORD_TOKEN_RE = re.compile(r"[^\W\d_]+")
+
+
+def repair_ligature_letters(text, page_words):
+    """Put back letters lost after a ligature glyph. When one glyph stands
+    for several letters ("fl", "ti"), PyMuPDF gives the letters after the
+    first zero-width boxes, and the table-cell path clips them away:
+    "snowflakes" came out "snowfakes" (confirmed on a test flyer, once its
+    ligature glyphs had their text back). The page's own words, from a
+    second independent tokenisation (see repair_merged_spacing), still have
+    them.
+
+    Touches a word only when it appears nowhere among the page's words and
+    exactly ONE page word equals it with a ligature sequence's trailing
+    letters restored at one position. It can only restore letters the page's
+    text layer has at that spot; it never invents a word."""
+    page_set = {w for pw in page_words for w in WORD_TOKEN_RE.findall(pw)}
+    if not page_set:
+        return text
+
+    def candidates(word):
+        found = set()
+        for i in range(1, len(word) + 1):
+            head, tail = word[:i], word[i:]
+            for seq in LIGATURE_SEQUENCES:
+                if head.endswith(seq[0]):
+                    fixed = head + seq[1:] + tail
+                    if fixed in page_set:
+                        found.add(fixed)
+        return found
+
+    def fix(m):
+        word = m.group(0)
+        if word in page_set or len(word) < 3:
+            return word
+        found = candidates(word)
+        return found.pop() if len(found) == 1 else word
+    return WORD_TOKEN_RE.sub(fix, text)
+
+
 def repair_merged_spacing(text, page_words):
     """General, domain-agnostic repair for words that lost their inter-word
     space during pymupdf4llm's markdown reconstruction (see MERGED_WORD_RE's
@@ -152,19 +195,22 @@ BACKGROUND_MIN_CHARS = 20
 
 
 def _drawing_facts(page):
-    """(images, text_spans) in drawing order, as plain Python values:
-    images [(Rect, seqno)] for every fill-image command, text_spans
-    [(seqno, visible, centre, nonspace_chars)] for every text span.
+    """(images, text_spans, opaque_rects) in drawing order, as plain Python
+    values: images [(Rect, seqno)] for every fill-image command; text_spans
+    [(seqno, visible, Rect, nonspace_chars)] for every text span; and
+    opaque_rects [(seqno, Rect, fill_rgb)] for every opaque filled RECTANGLE
+    (see _opaque_rect).
 
-    PyMuPDF 1.28.x's get_bboxlog() and get_texttrace() drop a reference to
-    None on every call (measured: about a thousand per 28-page document for
-    each, still present in 1.28.2). On Python 3.11, where None is not
-    immortal, that frees None after a few thousand pages in one process and
-    the interpreter aborts ("none_dealloc") -- confirmed on the fourth PDF
-    of a corpus run. So copy out what we need, drop PyMuPDF's objects, and
-    give back whatever references the calls took. Over-restoring only keeps
-    None alive, which it always is; under-restoring is the crash. Remove
-    this once the image runs a fixed PyMuPDF or Python 3.12+."""
+    PyMuPDF 1.28.x's get_bboxlog(), get_texttrace() and get_drawings() drop
+    references to None on every call (measured: about a thousand per 28-page
+    document for the first two, still present in 1.28.2). On Python 3.11,
+    where None is not immortal, that frees None after a few thousand pages in
+    one process and the interpreter aborts ("none_dealloc") -- confirmed on
+    the fourth PDF of a corpus run. So copy out what we need, drop PyMuPDF's
+    objects, and give back whatever references the calls took.
+    Over-restoring only keeps None alive, which it always is; under-restoring
+    is the crash. Remove this once the image runs a fixed PyMuPDF or Python
+    3.12+."""
     import ctypes
     import pymupdf
     before = sys.getrefcount(None)
@@ -174,22 +220,403 @@ def _drawing_facts(page):
     trace = page.get_texttrace()
     # render mode 3 is invisible text: the search-index OCR layer of a scan
     # or a pasted screenshot sits over the image but isn't what a reader sees
-    spans = [(s["seqno"], s["type"] != 3 and s["opacity"] > 0,
-              ((s["bbox"][0] + s["bbox"][2]) / 2, (s["bbox"][1] + s["bbox"][3]) / 2),
+    spans = [(s["seqno"], s["type"] != 3 and s["opacity"] > 0, pymupdf.Rect(s["bbox"]),
               sum(1 for c in s["chars"] if not chr(c[0]).isspace()))
              for s in trace]
-    del log, trace
+    drawings = page.get_drawings()
+    rects = [(d["seqno"], pymupdf.Rect(d["rect"]), tuple(d["fill"]))
+             for d in drawings if _opaque_rect(d)]
+    del log, trace, drawings
     for _ in range(max(before - sys.getrefcount(None), 0)):
         ctypes.pythonapi.Py_IncRef(ctypes.py_object(None))
-    return images, spans
+    return images, spans, rects
+
+
+def _opaque_rect(d):
+    """True for a fully opaque, filled, axis-aligned rectangle: a 're' item,
+    or lines/quads whose every point is a corner of the path's bounding box
+    (redaction bars are often drawn as three lines and a close). Anything
+    curved or slanted is out: a decorative swoosh's bounding box can overlap
+    text it doesn't actually cover, and treating that as cover would delete
+    real content."""
+    if d.get("fill") is None or (d.get("fill_opacity") or 0) < 0.99 \
+            or d.get("type") not in ("f", "fs"):
+        return False
+    r = d["rect"]
+    if r.width <= 0 or r.height <= 0:
+        return False
+    corners = [(r.x0, r.y0), (r.x1, r.y0), (r.x0, r.y1), (r.x1, r.y1)]
+    for item in d["items"]:
+        if item[0] == "re":
+            continue
+        if item[0] == "l":
+            pts = item[1:3]
+        elif item[0] == "qu":
+            q = item[1]
+            pts = (q.ul, q.ur, q.ll, q.lr)
+        else:
+            return False
+        if not all(any(abs(p.x - cx) < 0.5 and abs(p.y - cy) < 0.5 for cx, cy in corners)
+                   for p in pts):
+            return False
+    return True
 
 
 def _visible_chars_over(spans, rect, seqno):
     """Chars of visible text drawn AFTER drawing command `seqno` with the
     span's centre inside `rect`. Text drawn before the image is underneath
     it and hidden, so it doesn't count; nor does invisible text."""
-    return sum(n for sq, visible, centre, n in spans
-               if visible and sq > seqno and rect.contains(centre))
+    return sum(n for sq, visible, box, n in spans
+               if visible and sq > seqno
+               and rect.contains(((box.x0 + box.x1) / 2, (box.y0 + box.y1) / 2)))
+
+
+# A span counts as covered when a single opaque rectangle drawn after it hides
+# at least this share of its box. Redaction bars are cut to the line, so they
+# cover about all of it; a panel that merely touches a line's edge doesn't.
+COVERED_MIN_SHARE = 0.8
+
+
+# The drawing list alone can't be trusted for cover: on real annual reports it
+# reported opaque rectangles "over" plainly visible text -- black page-sized
+# fills (clipped or masked in ways get_drawings() doesn't expose) and a
+# near-white table fill over income-statement rows. Nor can "the box renders
+# mostly in the fill colour": a wide, sparse table row is mostly background.
+# The one test that holds: remove the candidate text from a copy of the page
+# and render both. Text that is really hidden changes nothing; visible text
+# takes its ink with it. A span is covered only if at most COVERED_MAX_PIXELS
+# pixels in its box change (at COVERED_RENDER_DPI). Measured: really hidden
+# spans change 0-1 pixels; a single visible nil dash in a wide table row
+# changes 20+, so a share of the box (a first attempt, 1%) let visible dashes
+# through. Any doubt keeps the text -- deleting real content is the worse
+# failure.
+COVERED_MAX_PIXELS = 4
+COVERED_PIXEL_TOLERANCE = 32
+COVERED_RENDER_DPI = 144
+
+
+def _redaction_rect(box):
+    """The rect a covered span is redacted with: inset vertically, so a
+    line's redaction can't clip the lines above and below it."""
+    import pymupdf
+    inset = box.height * 0.25
+    return pymupdf.Rect(box.x0, box.y0 + inset, box.x1, box.y1 - inset)
+
+
+def _render(page, dpi):
+    """(pixmap, had_errors) for the page, MuPDF's error printing silenced."""
+    import pymupdf
+    display = pymupdf.TOOLS.mupdf_display_errors()
+    pymupdf.TOOLS.mupdf_display_errors(False)
+    pymupdf.TOOLS.mupdf_warnings(reset=True)
+    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csRGB, alpha=False)
+    errors = "error" in pymupdf.TOOLS.mupdf_warnings(reset=True)
+    pymupdf.TOOLS.mupdf_display_errors(display)
+    return pix, errors
+
+
+def find_covered_text(page):
+    """find_covered_text on an unrotated view of the page (restored after):
+    span boxes, drawings and redaction rects must share one coordinate space,
+    and on a rotated page they didn't -- a redaction that removed nothing
+    changed nothing, which read as "hidden" (confirmed: whole visible pages of
+    a rotated report flagged). Returned rects are in unrotated coordinates;
+    prepare_pdf redacts with the page unrotated too."""
+    rot = page.rotation
+    if rot:
+        page.set_rotation(0)
+    try:
+        return _find_covered_unrotated(page)
+    finally:
+        if rot:
+            page.set_rotation(rot)
+
+
+def _find_covered_unrotated(page):
+    """Visible text spans hidden by an opaque rectangle drawn on top of them:
+    cosmetic redactions (black bars over text that is still in the file) and
+    text tucked under a panel. A span counts only if the geometry says a
+    later opaque rectangle covers it AND removing it leaves the rendered page
+    unchanged (see COVERED_MAX_PIXELS). [(span_rect, nonspace_chars, fill_rgb)]."""
+    import pymupdf
+    _, spans, rects = _drawing_facts(page)
+    candidates = []
+    for sq, visible, box, n in spans:
+        if not visible or n == 0 or box.is_empty:
+            continue
+        for rsq, rect, fill in rects:
+            if rsq > sq and (box & rect).get_area() >= COVERED_MIN_SHARE * box.get_area():
+                candidates.append((box, n, fill))
+                break
+    if not candidates:
+        return []
+    before, errors = _render(page, COVERED_RENDER_DPI)
+    # a page MuPDF can't render faithfully proves nothing (a pattern fill it
+    # doesn't understand renders as solid black over a readable page)
+    if errors:
+        return []
+    try:   # a malformed file that can't be copied or redacted proves nothing
+        copy = pymupdf.open()
+        copy.insert_pdf(page.parent, from_page=page.number, to_page=page.number)
+        cpage = copy[0]
+        for box, _, _ in candidates:
+            cpage.add_redact_annot(_redaction_rect(box), fill=False)
+        cpage.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                               graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                               text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+        after, errors = _render(cpage, COVERED_RENDER_DPI)
+        # "unchanged" only means hidden if the text really was removed
+        still_there = [bool(cpage.get_textbox(_redaction_rect(box)).strip())
+                       for box, _, _ in candidates]
+        copy.close()
+    except Exception:
+        return []
+    if errors or (after.width, after.height) != (before.width, before.height):
+        return []
+    scale = COVERED_RENDER_DPI / 72
+    covered = []
+    for (box, n, fill), kept in zip(candidates, still_there):
+        if kept:
+            continue
+        r = box & page.rect
+        x0, y0 = max(int(r.x0 * scale), 0), max(int(r.y0 * scale), 0)
+        x1, y1 = min(int(r.x1 * scale) + 1, before.width), min(int(r.y1 * scale) + 1, before.height)
+        total = changed = 0
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                total += 1
+                pb, pa = before.pixel(x, y), after.pixel(x, y)
+                if any(abs(pb[k] - pa[k]) > COVERED_PIXEL_TOLERANCE for k in range(3)):
+                    changed += 1
+        if total and changed <= COVERED_MAX_PIXELS:
+            covered.append((box, n, fill))
+    return covered
+
+
+def _merge_blocks(rects):
+    """Merge rects that overlap horizontally and sit within a few line heights
+    of each other vertically, until nothing more merges: the lines (and
+    superscripts) of one redacted paragraph or box become one block."""
+    rects = [r for r in rects]
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                a, b = rects[i], rects[j]
+                h = min(a.height, b.height)
+                gap = max(a.y0, b.y0) - min(a.y1, b.y1)
+                if a.x0 < b.x1 and b.x0 < a.x1 and gap < 4 * h:
+                    rects[i] = a | b
+                    del rects[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    return rects
+
+
+CMAP_CODE_RE = re.compile(rb"<([0-9A-Fa-f]+)>")
+
+
+def _cmap_codes(cmap: bytes) -> set[int]:
+    """Source codes a ToUnicode CMap maps (bfchar entries and bfrange spans)."""
+    codes = set()
+    for block in re.findall(rb"beginbfchar(.*?)endbfchar", cmap, re.S):
+        hexes = CMAP_CODE_RE.findall(block)
+        codes.update(int(h, 16) for h in hexes[0::2])
+    for block in re.findall(rb"beginbfrange(.*?)endbfrange", cmap, re.S):
+        for line in block.splitlines():
+            hexes = CMAP_CODE_RE.findall(line)
+            if len(hexes) >= 2:
+                codes.update(range(int(hexes[0], 16), int(hexes[1], 16) + 1))
+    return codes
+
+
+# Unicode's ligature presentation forms (U+FB00-FB06), spelled out: the same
+# text in the letters every engine and caller expects. A ToUnicode map that
+# points a glyph at one of these is rewritten to the letters -- the text
+# engine's table path drops U+FB02 outright ("snowﬂakes" -> "snowfakes",
+# confirmed on a test flyer).
+LIGATURE_CHARS = {0xFB00: "ff", 0xFB01: "fi", 0xFB02: "fl", 0xFB03: "ffi",
+                  0xFB04: "ffl", 0xFB05: "st", 0xFB06: "st"}
+
+
+def _spell_out_ligature_chars(cmap: bytes) -> tuple[bytes, int]:
+    """(cmap, n): bfchar destinations that are a single ligature character
+    replaced by their letters."""
+    n = 0
+
+    def fix_block(m):
+        nonlocal n
+
+        def fix_pair(pm):
+            nonlocal n
+            dst = int(pm.group(2), 16)
+            if len(pm.group(2)) == 4 and dst in LIGATURE_CHARS:
+                n += 1
+                letters = LIGATURE_CHARS[dst].encode("utf-16-be").hex().upper().encode()
+                return b"<" + pm.group(1) + b"> <" + letters + b">"
+            return pm.group(0)
+        return re.sub(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", fix_pair, m.group(0))
+    cmap = re.sub(rb"beginbfchar.*?endbfchar", fix_block, cmap, flags=re.S)
+    return cmap, n
+
+
+def repair_ligature_unicode(doc):
+    """Give ligature glyphs their text back. [{"font", "glyphs": {gid: text}}].
+
+    Word-exported PDFs (Calibri and friends) often draw "ti", "ff" and the
+    like as single ligature glyphs and leave them out of the font's
+    ToUnicode CMap. Readers then fall back to the glyph code as a character:
+    "Operating" extracts as "OperaƟng" (U+019F) or "Opera\ufffdng" --
+    confirmed on a test flyer. The embedded font says exactly what each
+    ligature glyph stands for, in its own GSUB ligature table, so this adds
+    the missing CMap entries from there. Nothing is inferred from the text.
+
+    Only Type0 fonts with Identity-H encoding, an identity CID-to-glyph map and
+    an embedded TrueType program qualify (code == glyph id there); only
+    glyphs the CMap leaves unmapped are added, never an existing mapping
+    changed -- except that a mapping to a ligature presentation character
+    (U+FB00-FB06) is spelled out as its letters (see LIGATURE_CHARS). Any font
+    that can't be read is left as it is."""
+    try:
+        from fontTools.ttLib import TTFont
+    except ImportError:
+        return []
+    import io
+    fixes = []
+    seen = set()
+    for pno in range(len(doc)):
+        for xref, ext, ftype, name, _, enc in doc[pno].get_fonts():
+            if xref in seen or ftype != "Type0" or enc != "Identity-H":
+                continue
+            seen.add(xref)
+            try:
+                tu = doc.xref_get_key(xref, "ToUnicode")
+                desc = doc.xref_get_key(xref, "DescendantFonts")
+                if tu[0] != "xref" or "CIDToGIDMap/Identity" not in desc[1].replace(" ", "") \
+                        and "CIDToGIDMap" in desc[1]:
+                    continue
+                tu_xref = int(tu[1].split()[0])
+                buf = doc.extract_font(xref)[3]
+                if not buf:
+                    continue
+                font = TTFont(io.BytesIO(buf), lazy=True)
+                if "GSUB" not in font or "cmap" not in font:
+                    continue
+                order = font.getGlyphOrder()
+                gid_of = {g: i for i, g in enumerate(order)}
+                # glyph name -> character, from the font's own cmap
+                char_of = {}
+                for table in font["cmap"].tables:
+                    if table.isUnicode():
+                        for cp, g in table.cmap.items():
+                            char_of.setdefault(g, chr(cp))
+                ligatures = {}
+                for lookup in font["GSUB"].table.LookupList.Lookup:
+                    for st in lookup.SubTable:
+                        st = getattr(st, "ExtSubTable", st)
+                        for first, ligs in getattr(st, "ligatures", {}).items():
+                            for lg in ligs:
+                                parts = [first, *lg.Component]
+                                if all(p in char_of for p in parts):
+                                    ligatures.setdefault(gid_of[lg.LigGlyph],
+                                                         "".join(char_of[p] for p in parts))
+                cmap = doc.xref_stream(tu_xref)
+                missing = {g: t for g, t in ligatures.items()
+                           if g not in _cmap_codes(cmap) and g <= 0xFFFF}
+                cmap, spelled = _spell_out_ligature_chars(cmap)
+                if not missing and not spelled:
+                    continue
+                if not missing:
+                    doc.update_stream(tu_xref, cmap)
+                    fixes.append({"font": name, "glyphs": {}, "spelled_out": spelled})
+                    continue
+                entries = b"".join(b"<%04X> <%s>\n" % (g, t.encode("utf-16-be").hex().upper().encode())
+                                   for g, t in sorted(missing.items()))
+                block = b"%d beginbfchar\n%sendbfchar\n" % (len(missing), entries)
+                if b"endcmap" not in cmap:
+                    continue
+                doc.update_stream(tu_xref, cmap.replace(b"endcmap", block + b"endcmap", 1))
+                fixes.append({"font": name, "glyphs": {str(g): t for g, t in sorted(missing.items())},
+                              "spelled_out": spelled})
+            except Exception:
+                continue
+    return fixes
+
+
+def prepare_pdf(pdf_path, output_path):
+    """Write the copy every engine converts, and return what was changed:
+    {"pages": [covered-text rows], "ligature_fixes": [...]}.
+
+    1. Covered text REMOVED (a real PDF redaction, not another box on top).
+       A cosmetic redaction keeps the original text in the file; an OCR
+       engine reads only what renders, but a text-layer engine reads it all
+       -- confirmed on a test flyer, where the text engine emitted four
+       blacked-out day boxes and a name hidden under the header band, with
+       no warning. Graphics and images are untouched, so the page renders
+       as before (the bars stay black; OCR sees the same page). Text under a
+       dark fill is marked with one invisible "[redacted]" per block (render
+       mode 3: in the text layer, not on the page), so the text output says
+       something was there; text hidden under any other fill is dropped
+       without a marker. See find_covered_text for how "covered" is proven.
+    2. Ligature glyphs given their text back (repair_ligature_unicode).
+
+    A document needing neither is copied byte for byte, so it converts
+    exactly as it did before this step existed."""
+    import pymupdf
+    doc = pymupdf.open(pdf_path)
+    report = []
+    for page in doc:
+        rot = page.rotation
+        if rot:
+            page.set_rotation(0)   # find_covered_text's coordinates are unrotated
+        try:
+            covered = _strip_page(page)
+        finally:
+            if rot:
+                page.set_rotation(rot)
+        if covered:
+            report.append(covered)
+    ligature_fixes = repair_ligature_unicode(doc)
+    if report or ligature_fixes:
+        doc.save(output_path, garbage=3, deflate=True)
+        doc.close()
+    else:
+        # nothing to change: hand the engines the original bytes, not a
+        # re-save, so these documents convert exactly as before
+        doc.close()
+        import shutil
+        shutil.copyfile(pdf_path, output_path)
+    return {"pages": report, "ligature_fixes": ligature_fixes}
+
+
+def _strip_page(page):
+    """Covered-text removal for one unrotated page: its report row, or None."""
+    import pymupdf
+    try:
+        covered = _find_covered_unrotated(page)
+    except Exception as e:   # never fail a conversion over this check
+        err(f"[pdf2md] --prepare: page {page.number + 1} not checked for covered text: {e}")
+        return None
+    if not covered:
+        return None
+    markers = []   # dark-covered spans, merged below into blocks
+    for box, n, fill in covered:
+        page.add_redact_annot(_redaction_rect(box), fill=False)
+        if sum(fill) / 3 < 0.2:
+            markers.append(pymupdf.Rect(box))
+    markers = _merge_blocks(markers)
+    page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                          graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                          text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+    for m in markers:
+        page.insert_text((m.x0, m.y0 + min(m.height, 10) * 0.8), "[redacted]",
+                         fontsize=min(m.height, 10) * 0.8, render_mode=3)
+    return {"page": page.number + 1, "covered_spans": len(covered),
+            "covered_chars": sum(n for _, n, _ in covered),
+            "redaction_markers": len(markers)}
 
 
 def _page_image_coverage(page):
@@ -204,16 +631,18 @@ def _page_image_coverage(page):
     both results are clamped to 1.0.
 
     Background images are reported apart so image_page ignores them.
-    Confirmed failure without this: a one-page grid flyer (ten day boxes of
-    visible text over a background photo stored as six full-width strips)
-    measured 67.5% image coverage, routed to MinerU despite a complete text
-    layer, and MinerU silently dropped 4 of the 10 boxes and the title."""
+    Confirmed case: a one-page grid flyer (day boxes of visible text over a
+    background photo stored as six full-width strips) measured 67.5% image
+    coverage and routed to MinerU despite a complete text layer; MinerU lost
+    the title (white text on a coloured band) and scrambled the box order.
+    (Some of its boxes were also blacked out -- cosmetic redactions, handled
+    separately by prepare_pdf, so the text engine can't leak them.)"""
     page_area = page.rect.width * page.rect.height
     if page_area <= 0:
         return 0.0, 0.0
     # each placed image's drawing-sequence number, to tell text drawn over it
     # from text underneath it; texttrace seqnos index the same sequence
-    image_seqnos, spans = _drawing_facts(page)
+    image_seqnos, spans, _ = _drawing_facts(page)
     covered = background = 0.0
     for img in page.get_images(full=True):
         for rect in page.get_image_rects(img[0]):
@@ -468,7 +897,52 @@ def format_title_index(index):
     return "\n\n" + "\n".join(lines) + "\n"
 
 
-def to_markdown_text(pdf_path):
+# Only images at least this share of the page are hidden (see
+# hide_background_images): backgrounds are big (each strip of the test flyer's
+# photo is 11% of the page); a signature with the signatory's name printed
+# over it is 1-2%, and hiding one lost that name line on a real declaration.
+HIDE_MIN_PAGE_SHARE = 0.05
+
+
+def hide_background_images(doc):
+    """Remove, in memory only, every image covering at least
+    HIDE_MIN_PAGE_SHARE of the page with at least BACKGROUND_MIN_CHARS of
+    visible text drawn over it; return how many. The text engine's
+    layout model treats text over an image as "picture text" and flattens it
+    line by line across the whole image -- confirmed on a grid flyer over a
+    background photo, where five columns of day boxes came out interleaved
+    and a line was lost. With the backgrounds gone the same model finds the
+    grid and emits it as a table. Only the text engine's in-memory copy is
+    touched: nothing is saved, and OCR engines still see the real page.
+    Images without text over them (logos, icons, photos) stay."""
+    import pymupdf
+    hidden = 0
+    for page in doc:
+        rot = page.rotation
+        if rot:
+            page.set_rotation(0)
+        try:
+            images, spans, _ = _drawing_facts(page)
+            page_area = page.rect.get_area()
+            doomed = [r for r, sq in images
+                      if (r & page.rect).get_area() >= HIDE_MIN_PAGE_SHARE * page_area
+                      and _visible_chars_over(spans, r & page.rect, sq) >= BACKGROUND_MIN_CHARS]
+            for r in doomed:
+                page.add_redact_annot(r, fill=False)   # no box painted over the text
+            if doomed:
+                page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_REMOVE,
+                                      graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                                      text=pymupdf.PDF_REDACT_TEXT_NONE)
+                hidden += len(doomed)
+        except Exception:
+            continue
+        finally:
+            if rot:
+                page.set_rotation(rot)
+    return hidden
+
+
+def to_markdown_text(pdf_path, hide_background=True):
     """Digital PDF -> markdown via pymupdf4llm (CPU, no model load).
     Returns (markdown, page_boxes) -- page_boxes is a list of per-page block
     metadata (class, bbox, character position, and the block's own text) for
@@ -512,7 +986,10 @@ def to_markdown_text(pdf_path):
     """
     import pymupdf
     import pymupdf4llm
-    chunks = pymupdf4llm.to_markdown(pdf_path, use_ocr=False, page_chunks=True)
+    doc = pymupdf.open(pdf_path)
+    if hide_background:
+        hide_background_images(doc)
+    chunks = pymupdf4llm.to_markdown(doc, use_ocr=False, page_chunks=True)
     plain_doc = pymupdf.open(pdf_path)  # second, independent tokenisation -- see repair_merged_spacing()
 
     parts = []
@@ -548,11 +1025,13 @@ def to_markdown_text(pdf_path):
             # while MinerU's is already a plain field.
             block_text = text[box["pos"][0]:box["pos"][1]] if box.get("pos") else None
             if block_text:
-                block_text = repair_merged_spacing(block_text, page_words)
+                block_text = repair_ligature_letters(
+                    repair_merged_spacing(block_text, page_words), page_words)
             page_boxes.append({**box, "text": block_text,
                                 "page_number": page_number,
                                 "doc_pos": (offset + box["pos"][0], offset + box["pos"][1]) if box.get("pos") else None})
-        repaired_text = repair_merged_spacing(text, page_words)
+        repaired_text = repair_ligature_letters(repair_merged_spacing(text, page_words),
+                                                page_words)
         parts.append(repaired_text)
         offset += len(repaired_text)
 
@@ -608,6 +1087,12 @@ def main():
                     help="detect per-page rotation via Tesseract OSD and write a corrected copy "
                          "to OUTPUT.pdf, then exit. Only the /Rotate flag is changed -- no pixel "
                          "or content is altered. Used by pdf2md-auto.sh ahead of every conversion.")
+    ap.add_argument("--prepare", metavar="OUTPUT.pdf",
+                    help="write the copy the engines convert -- text hidden under opaque "
+                         "rectangles removed (cosmetic redactions, text under a panel), "
+                         "ligature glyphs given their text back; see prepare_pdf -- print a "
+                         "JSON report of what changed to stdout, and exit. Run by "
+                         "pdf2md_route.py and pdf2md-auto.sh after --derotate.")
     ap.add_argument("--rotate-dpi", type=int, default=150,
                     help="render DPI used for --derotate's OSD pass (default 150)")
     ap.add_argument("--rotate-min-confidence", type=float, default=1.0,
@@ -639,6 +1124,22 @@ def main():
             err(f"[pdf2md] --derotate: {len(unresolved)} page(s) flagged rotated but UNRESOLVED "
                 f"-- see WARNING lines above, review manually: "
                 f"{[p for p, _, _ in unresolved]}")
+        return
+
+    if args.prepare:
+        import json
+        try:
+            report = prepare_pdf(args.input, args.prepare)
+        except Exception as e:
+            err(f"[pdf2md] ERROR during --prepare: {e}")
+            sys.exit(6)
+        for r in report["pages"]:
+            log(f"[pdf2md] --prepare: page {r['page']}: removed {r['covered_chars']} chars of "
+                f"text hidden under opaque shapes ({r['redaction_markers']} redaction marker(s))")
+        for f in report["ligature_fixes"]:
+            log(f"[pdf2md] --prepare: font {f['font']}: gave {len(f['glyphs'])} ligature "
+                f"glyph(s) their text back ({', '.join(sorted(set(f['glyphs'].values())))})")
+        print(json.dumps(report))
         return
 
     if args.slice:

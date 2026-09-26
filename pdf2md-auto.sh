@@ -229,6 +229,17 @@ else
   exit 2
 fi
 
+# Forced engine and whole-doc routing (the page router exited above and does
+# this itself): convert the prepared copy -- text hidden under opaque
+# rectangles (cosmetic redactions, text under a panel) removed, the page
+# rendering as before, and ligature glyphs given their text back. See
+# engines/text/pdf2md.py's prepare_pdf.
+docker run --rm -v "$DIR":/work "${DOCKER_USER[@]}" -e HOME=/tmp \
+  -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+  pdf2md-text "/work/$BASE" --prepare "/work/$STEM.prepared.pdf" >&2
+BASE="$STEM.prepared.pdf"
+IN="$DIR/$BASE"
+
 # Post-conversion verification (report-only): when the caller asked for a
 # file output (-o), check that the markdown kept the money-like numbers the
 # PDF's text layer contains -- layout engines can silently drop blocks

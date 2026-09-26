@@ -54,7 +54,7 @@ account.
 
 ## Known defects, and how each is handled
 
-Four distinct silent-failure classes were found and fixed during validation.
+Six distinct silent-failure classes were found and fixed during validation.
 Each needed a different kind of fix — worth understanding before touching
 this code, since a fix for one class does not generalise to another.
 
@@ -116,17 +116,34 @@ On by default; skip with `--no-reconcile-spelling` (roughly doubles MinerU's
 per-document runtime — the reference pass costs about 40s on top of
 `hybrid-engine`'s ~85s).
 
-### 4. Whole blocks dropped on a designed page sent to OCR (layout)
-A one-page grid flyer (ten day boxes of visible text set over a background
+### 4. Designed pages sent to OCR, and text hidden under redactions (layout, privacy)
+A one-page grid flyer (day boxes of visible text set over a background
 photo) has a complete text layer, but its background image covered 67.5% of
-the page, so the `image_page` rule sent it to MinerU. MinerU emitted six of
-the ten boxes, lost the title, and said nothing. Docling kept only the footer.
+the page, so the `image_page` rule sent it to MinerU. MinerU lost the title
+(white text on a coloured band) and scrambled the box order. Docling kept
+only the footer. Four of the boxes were also blacked out: a *cosmetic*
+redaction, with the original text still in the file, and a name was tucked
+under the header band. OCR reads only what renders, so it rightly left those
+out; the text engine reads the text layer and emitted them all, silently.
 
-Two fixes, each general:
+Three fixes, each general:
 
+- **Covered text is removed before any engine runs** (`pdf2md.py
+  --prepare`, run by the router and by `pdf2md-auto.sh`). Text counts as
+  covered only when an opaque filled *rectangle* is drawn over it (by drawing
+  order) **and** removing it leaves the rendered page unchanged (at most 4
+  pixels at 144 dpi; a visible nil dash changes 20+). The geometry alone
+  flagged plainly visible text on real annual reports (masked fills, a
+  near-white table fill over statement rows, rotated pages); the render
+  comparison clears all of those. Covered text is removed with a real PDF
+  redaction; graphics and images are untouched, so the page renders as
+  before. A document with nothing to change is copied byte for byte. Text under a dark fill leaves one invisible
+  `[redacted]` marker per block in the text layer; text under any other
+  fill is dropped without one. The manifest gets a `covered_text_removed`
+  warning per page. Only rectangles count as cover: a curved or slanted
+  shape's bounding box can overlap text it doesn't hide.
 - **Background images don't make an image page.** An image with enough
-  *visible* text drawn *over* it (by drawing order, from PyMuPDF's
-  `get_bboxlog()`/`get_texttrace()`) is background: the text is the content.
+  *visible* text drawn *over* it is background: the text is the content.
   Invisible text (render mode 3, the OCR layer of a scan or a pasted
   screenshot) and text underneath the image don't count, so the case
   `image_page` exists for still routes to OCR. The page reports
@@ -134,11 +151,34 @@ Two fixes, each general:
   real annual reports, every page this changed was a designed page or a
   letter on full-page letterhead, and none was a scan or a pasted table.
 - **Content-loss check** (`engines/text/verify_text.py`): per page, the share
-  of the text layer's words the output kept (the page and its neighbours, so
-  a block moved across a page break doesn't count as lost). Below 80%, the
-  manifest gets a `text_layer_content_missing` warning with a sample of the
-  missing words. It is report-only, like `verify_numbers`. On the flyer,
-  MinerU scores 59%, Docling 6% and the text engine 92%.
+  of the (visible) text layer's words the output kept, counting the page and
+  its neighbours, so a block moved across a page break isn't lost. Below 80%,
+  the manifest gets a `text_layer_content_missing` warning with a sample of
+  the missing words. It is report-only, like `verify_numbers`.
+
+### 5. Ligatures extracted as junk (text)
+Word-exported PDFs often draw "ti", "ff" and the like as single ligature
+glyphs and leave them out of the font's ToUnicode map, so "Operating"
+extracts as `OperaƟng` or `Opera�ng`. The embedded font's own GSUB ligature
+table says what each ligature glyph stands for, so `--prepare` adds the
+missing map entries from there (Identity-H TrueType fonts only; existing
+entries are never changed). The manifest lists them under `ligature_fixes`.
+
+### 6. Text over a background image flattened across columns (layout)
+The text engine's layout model treats text drawn over an image as "picture
+text" and writes it out line by line across the whole image. On the grid
+flyer, that interleaved five columns of day boxes and lost a line. The text
+engine now hides, in its own in-memory copy only, every image that covers at
+least 5% of the page and has visible text drawn over it; the same model then
+finds the grid and emits a table. Logos, icons, photos without text on them,
+and signatures (a name printed over a signature image is 1-2% of the page;
+hiding one lost that line on a real declaration) stay. OCR engines still see
+the real page.
+
+A ligature glyph's later letters get zero-width boxes, and the table-cell
+path clips them ("snowflakes" came out "snowfakes"). A word that appears
+nowhere on the page is repaired only when exactly one of the page's own
+words equals it with a ligature's letters restored.
 
 ## Regression testing
 
