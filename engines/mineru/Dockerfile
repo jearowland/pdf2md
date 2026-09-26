@@ -6,7 +6,12 @@
 #   docker build -t mineru:latest -f Dockerfile.mineru .
 # Then build this:
 #   docker build -t pdf2md-mineru .
-FROM mineru:latest
+# BASE defaults to MinerU's official image. A worker that has lost it but still
+# has a working pdf2md-mineru can layer this build on that instead (same base
+# underneath): docker tag pdf2md-mineru pdf2md-mineru:prev &&
+#   docker build --build-arg BASE=pdf2md-mineru:prev -t pdf2md-mineru .
+ARG BASE=mineru:latest
+FROM ${BASE}
 
 # The base image (mineru:latest) bakes ALL models in at build time and sets
 # MINERU_MODEL_SOURCE=local via its entrypoint. We override the entrypoint below,
