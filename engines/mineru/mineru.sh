@@ -51,6 +51,7 @@ set +e
 # job's own directory is mounted. --gpus all stays.
 flock "$LOCK_FILE" docker run --rm --gpus all \
   --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
   --network none --shm-size 32g \
   --cap-drop ALL --security-opt no-new-privileges \
   --pids-limit 4096 --memory 20g \
