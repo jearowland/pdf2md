@@ -7,3 +7,7 @@ if docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; t
 else
   DOCKER_USER=(--user "$(id -u):$(id -g)")
 fi
+# DOCKER_HARDEN (security review F-03, 2026-09-27): the text container reads documents uploaded from outside, so
+# it gets no network (it needs none: layout model, Tesseract and LibreOffice are all in the image), no
+# capabilities or privilege escalation, and pids/memory limits. Accepted by rootful and rootless Docker alike.
+DOCKER_HARDEN=(--network none --cap-drop ALL --security-opt no-new-privileges --pids-limit 1024 --memory 12g)

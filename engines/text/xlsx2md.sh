@@ -24,7 +24,7 @@ BASE="$(basename "$IN")"
 
 exec docker run --rm \
   --entrypoint python \
-  "${DOCKER_USER[@]}" -e HOME=/tmp \
+  "${DOCKER_USER[@]}" "${DOCKER_HARDEN[@]}" -e HOME=/tmp \
   -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
   -v "$DIR":/work \
   pdf2md-text /usr/local/bin/xlsx2md.py "/work/$BASE" "$@"

@@ -43,13 +43,20 @@ echo "[mineru.sh] waiting for GPU lock ($LOCK_FILE)..." >&2
 # fighting it. Not `exec`, since a following command is needed; exit status
 # is preserved manually so a real conversion failure still propagates.
 set +e
+# Hardened (security review F-03, 2026-09-27): this container reads documents
+# uploaded from outside, so it gets no network (the models are baked into the
+# image), no host IPC (a private shared-memory segment instead), no root
+# (the calling user, as on rootful workers; HOME=/tmp for caches), no
+# capabilities or privilege escalation, and pids/memory limits. Only this
+# job's own directory is mounted. --gpus all stays.
 flock "$LOCK_FILE" docker run --rm --gpus all \
-  --shm-size 32g --ipc=host \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  --network none --shm-size 32g \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --pids-limit 4096 --memory 20g \
   -v "$MODELS":/models \
   -v "$DIR":/work \
   pdf2md-mineru "/work/$BASE" "$@"
 STATUS=$?
 set -e
-docker run --rm -v "$DIR":/work --entrypoint chown pdf2md-mineru \
-  -R "$(id -u):$(id -g)" /work >/dev/null 2>&1 || true
 exit "$STATUS"

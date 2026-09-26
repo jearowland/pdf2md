@@ -85,7 +85,7 @@ def docker_text(workdir: Path, argv: list[str], dev_bind: bool,
     """Run the pdf2md-text container exactly the way pdf2md.sh does
     (input dir mounted as /work, caller uid/gid), optionally overlaying the
     local pdf2md.py for pre-rebuild testing."""
-    cmd = ["docker", "run", "--rm", *docker_user(), "-e", "HOME=/tmp",
+    cmd = ["docker", "run", "--rm", *docker_user(), *DOCKER_HARDEN, "-e", "HOME=/tmp",
            "-v", "/etc/passwd:/etc/passwd:ro", "-v", "/etc/group:/etc/group:ro",
            "-v", f"{workdir}:/work"]
     if dev_bind:
@@ -98,6 +98,11 @@ def docker_text(workdir: Path, argv: list[str], dev_bind: bool,
                           capture_output=capture)
 
 
+# as engines/docker-user.sh's DOCKER_HARDEN (security review F-03): documents
+# come from outside, so no network, no capabilities, no privilege escalation,
+# pids/memory limits
+DOCKER_HARDEN = ["--network", "none", "--cap-drop", "ALL", "--security-opt",
+                 "no-new-privileges", "--pids-limit", "1024", "--memory", "12g"]
 _DOCKER_USER: list[str] | None = None
 
 
@@ -355,7 +360,7 @@ def main():
     # 7. number-preservation check (unchanged from auto.sh, report-only)
     try:
         subprocess.run(["docker", "run", "--rm", "-v", f"{workdir}:/work",
-                        *docker_user(), "-e", "HOME=/tmp",
+                        *docker_user(), *DOCKER_HARDEN, "-e", "HOME=/tmp",
                         "-v", "/etc/passwd:/etc/passwd:ro",
                         "-v", "/etc/group:/etc/group:ro",
                         "--entrypoint", "python3", "pdf2md-text",

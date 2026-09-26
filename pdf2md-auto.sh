@@ -152,7 +152,7 @@ if [ "$EXT" = "doc" ] || [ "$EXT" = "xls" ]; then
   CONVERTED="$STEM.from${EXT}.pdf"
   echo "[pdf2md-auto] .$EXT input -> converting to PDF via LibreOffice first ($CONVERTED)..." >&2
   docker run --rm -v "$DIR":/work --entrypoint bash \
-    "${DOCKER_USER[@]}" -e HOME=/tmp \
+    "${DOCKER_USER[@]}" "${DOCKER_HARDEN[@]}" -e HOME=/tmp \
     -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
     pdf2md-text -c \
     "mkdir -p /work/.libreoffice-tmp && soffice --headless --convert-to pdf --outdir /work/.libreoffice-tmp '/work/$BASE' && mv '/work/.libreoffice-tmp/$STEM.pdf' '/work/$CONVERTED' && rmdir /work/.libreoffice-tmp"
@@ -170,7 +170,7 @@ fi
 
 if [ -z "$SKIP_DEROTATE" ]; then
   echo "[pdf2md-auto] checking page rotation..." >&2
-  docker run --rm -v "$DIR":/work "${DOCKER_USER[@]}" -e HOME=/tmp \
+  docker run --rm -v "$DIR":/work "${DOCKER_USER[@]}" "${DOCKER_HARDEN[@]}" -e HOME=/tmp \
     -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
     pdf2md-text "/work/$BASE" --derotate "/work/$STEM.derotated.pdf"
   BASE="$STEM.derotated.pdf"
@@ -215,7 +215,7 @@ elif [ -n "$FORCE_ENGINE" ]; then
   echo "[pdf2md-auto] forced engine: $ENGINE (whole-document)" >&2
 elif [ "$ROUTE" = "whole-doc" ]; then
   # Cheap classify: no GPU, no model load needed on this path.
-  CLASS=$(docker run --rm -v "$DIR":/work "${DOCKER_USER[@]}" -e HOME=/tmp \
+  CLASS=$(docker run --rm -v "$DIR":/work "${DOCKER_USER[@]}" "${DOCKER_HARDEN[@]}" -e HOME=/tmp \
     -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
     pdf2md-text "/work/$BASE" --classify-only | tail -n 1)   # verdict is the last line; tolerate stray library output above it
   case "$CLASS" in
@@ -234,7 +234,7 @@ fi
 # rectangles (cosmetic redactions, text under a panel) removed, the page
 # rendering as before, and ligature glyphs given their text back. See
 # engines/text/pdf2md.py's prepare_pdf.
-docker run --rm -v "$DIR":/work "${DOCKER_USER[@]}" -e HOME=/tmp \
+docker run --rm -v "$DIR":/work "${DOCKER_USER[@]}" "${DOCKER_HARDEN[@]}" -e HOME=/tmp \
   -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
   pdf2md-text "/work/$BASE" --prepare "/work/$STEM.prepared.pdf" >&2
 BASE="$STEM.prepared.pdf"
@@ -260,8 +260,8 @@ run_and_verify() {
   case "$OUT_MD" in /*) : ;; ?*) OUT_MD="$DIR/$OUT_MD" ;; esac
   if [ $rc -eq 0 ] && [ -n "$OUT_MD" ] && [ -f "$OUT_MD" ]; then
     local odir; odir=$(cd "$(dirname "$OUT_MD")" && pwd)
-    docker run --rm -v "$DIR":/work -v "$odir":/out "${DOCKER_USER[@]}"       -e HOME=/tmp -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro       --entrypoint python3 pdf2md-text /usr/local/bin/verify_numbers.py       "/work/$BASE" "/out/$(basename "$OUT_MD")" || true
-    docker run --rm -v "$DIR":/work -v "$odir":/out "${DOCKER_USER[@]}" \
+    docker run --rm -v "$DIR":/work -v "$odir":/out "${DOCKER_USER[@]}" "${DOCKER_HARDEN[@]}"       -e HOME=/tmp -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro       --entrypoint python3 pdf2md-text /usr/local/bin/verify_numbers.py       "/work/$BASE" "/out/$(basename "$OUT_MD")" || true
+    docker run --rm -v "$DIR":/work -v "$odir":/out "${DOCKER_USER[@]}" "${DOCKER_HARDEN[@]}" \
       -e HOME=/tmp -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
       --entrypoint python3 pdf2md-text /usr/local/bin/verify_text.py \
       "/work/$BASE" "/out/$(basename "$OUT_MD")" || true

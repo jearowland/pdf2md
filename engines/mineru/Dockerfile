@@ -13,7 +13,15 @@ FROM mineru:latest
 # so re-assert local here — this uses the baked-in weights (reproducible, offline,
 # no multi-GB runtime download).
 ENV MINERU_MODEL_SOURCE=local \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    MINERU_TOOLS_CONFIG_JSON=/root/mineru.json \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+# mineru.sh runs this container as the calling (non-root) user with no
+# network. The baked models and mineru.json live under /root (mode 700 in the
+# base image), so make them readable -- not writable -- by that user; HOME
+# points at /tmp at run time, so MinerU is told where its config is above.
+RUN chmod 755 /root && chmod -R a+rX /root/.cache /root/mineru.json
 
 # wamerican: a plain wordlist (no ML, ~1MB) used ONLY to detect the pattern
 # "a repeated rare token has a same-document real-word variant" -- the signature
