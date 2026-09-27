@@ -26,10 +26,10 @@ typical symptom is `pdf2md_route.py` failing at `--classify-pages` or `--slice` 
 
 ## Which branch workers run
 
-**`per-page-routing`.** It is `main` plus three things: per-page engine routing
-(`pdf2md_route.py`, now the default PDF path in `pdf2md-auto.sh`), the Docling engine, and
-MinerU's `--middle-json` flag. `main` is an ancestor of it, so nothing on `main` is missing
-from it.
+**`main`.** `per-page-routing` (per-page engine routing, the Docling engine, MinerU's
+`--middle-json` flag, and everything since) was merged into `main` on 2026-09-27, so the two
+are the same; workers still on `per-page-routing` can switch with
+`git checkout main && git pull --ff-only`.
 
 Every worker should run the **same commit**, with images built from that commit. Record it:
 
