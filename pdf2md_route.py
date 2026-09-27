@@ -112,6 +112,24 @@ def clean_label(text: str) -> str:
     return " ".join(words[:5])
 
 
+def free_mineru_gpu(timeout: int = 180) -> bool:
+    """Ask this job's MinerU server (if one is running) to unload its models
+    and wait until it has: one GPU model at a time. With both loaded, a
+    24 GB card peaked at 23.9 GB in testing, and a 12 GB card would run out."""
+    import os
+    q = os.environ.get("PDF2MD_MINERU_SERVER", "")
+    if not q or not Path(q, "requests").is_dir() or Path(q, "exited").exists():
+        return True
+    Path(q, "unloaded").unlink(missing_ok=True)
+    Path(q, "unload").touch()
+    for _ in range(timeout):
+        if Path(q, "unloaded").exists() or Path(q, "exited").exists():
+            return True
+        time.sleep(1)
+    err("[route] alt text: the MinerU server did not unload in time; skipping alt text")
+    return False
+
+
 def label_icons(icon_dir: Path, icons: list[dict], url: str, model: str) -> list[dict]:
     """Ask a local vision model (Ollama at `url`) for each icon's label; an
     icon it can't label keeps an empty label (rendered "[icon]"). The model is
@@ -379,7 +397,7 @@ def main():
         text_pages = {p for a, b, eng in runs if eng == "text" for p in range(a, b + 1)}
         icons = [i for i in json.loads(r.stdout[r.stdout.find("["):] or "[]")
                  if i["page"] in text_pages]
-        if icons:
+        if icons and free_mineru_gpu():
             labels = label_icons(icon_dir, icons, args.alt_text_ollama, args.alt_text_model)
             err(f"[route] alt text: {sum(1 for l in labels if l['label'])} of "
                 f"{len(labels)} icon(s) labelled")

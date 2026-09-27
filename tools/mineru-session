@@ -16,7 +16,22 @@ REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 LOCK_FILE="${PDF2MD_MINERU_LOCK:-/tmp/pdf2md-mineru.lock}"
 MODELS="${MINERU_MODELS:-$HOME/.cache/mineru-models}"
 
+prune() {
+  # queue dirs left by jobs killed outright: the server has exited (or its
+  # heartbeat is long stale) and nobody stopped it; the server already
+  # emptied them of pages on its way out, this removes the rest
+  local d
+  for d in "$REPO"/tmp/mineru-q.*; do
+    [ -d "$d" ] || continue
+    if { [ -f "$d/exited" ] && [ -n "$(find "$d/exited" -mmin +10 2>/dev/null)" ]; } \
+       || { [ -f "$d/alive" ] && [ -n "$(find "$d/alive" -mmin +30 2>/dev/null)" ]; }; then
+      rm -rf "$d"
+    fi
+  done
+}
+
 start() {
+  prune
   mkdir -p "$REPO/tmp" "$MODELS"
   local q; q="$(mktemp -d "$REPO/tmp/mineru-q.XXXXXX")"
   mkdir -p "$q/requests"

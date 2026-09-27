@@ -501,8 +501,9 @@ SERVE_IDLE_TIMEOUT = 600
 
 
 def serve(queue):
-    """One MinerU for a whole job: a mineru-api loads the models once, at
-    start, and stays up until the job ends (engines/mineru/mineru.sh submits here when
+    """One MinerU for a whole job: a mineru-api loads the models on the first
+    request and stays up until the job ends (or until QUEUE/unload asks it to
+    free the GPU; the next request loads them again) (engines/mineru/mineru.sh submits here when
     PDF2MD_MINERU_SERVER names this queue; tools/mineru-session starts and
     stops it). Each request is QUEUE/requests/<id>.json holding this
     wrapper's own argv, paths inside QUEUE; the reply is QUEUE/<id>/status.json
@@ -513,24 +514,44 @@ def serve(queue):
     import threading
     import urllib.request
     global API_URL
-    # mineru-api keeps its working files under ./output: run it in a scratch
-    # dir inside the container (the image's /work isn't mounted here, and the
-    # container, scratch included, is gone when the job ends)
-    api = subprocess.Popen(["mineru-api", "--host", "127.0.0.1", "--port", str(API_PORT),
-                            "--enable-vlm-preload", "true"],
-                           cwd=tempfile.mkdtemp(prefix="mineru-api-"),
-                           stdout=open(os.path.join(queue, "api.log"), "w"),
-                           stderr=subprocess.STDOUT)
-    API_URL = f"http://127.0.0.1:{API_PORT}"
-    for _ in range(600):   # models load here, once
-        if api.poll() is not None:
-            err(f"[mineru2md] mineru-api exited ({api.returncode}); see api.log")
-            sys.exit(4)
+    api = None
+
+    def start_api():
+        """mineru-api with the models loaded; started on the first request
+        (and again after an unload). It keeps its working files under
+        ./output, so it runs in a scratch dir inside the container (the
+        image's /work isn't mounted here; the container, scratch included,
+        is gone when the job ends)."""
+        global API_URL
+        proc = subprocess.Popen(["mineru-api", "--host", "127.0.0.1", "--port", str(API_PORT),
+                                 "--enable-vlm-preload", "true"],
+                                cwd=tempfile.mkdtemp(prefix="mineru-api-"),
+                                stdout=open(os.path.join(queue, "api.log"), "a"),
+                                stderr=subprocess.STDOUT)
+        API_URL = f"http://127.0.0.1:{API_PORT}"
+        for _ in range(600):   # models load here
+            if proc.poll() is not None:
+                err(f"[mineru2md] mineru-api exited ({proc.returncode}); see api.log")
+                sys.exit(4)
+            try:
+                urllib.request.urlopen(API_URL + "/docs", timeout=2)
+                return proc
+            except Exception:
+                time.sleep(1)
+        proc.kill()
+        err("[mineru2md] mineru-api did not come up in 10 minutes")
+        sys.exit(4)
+
+    def stop_api(proc):
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
         try:
-            urllib.request.urlopen(API_URL + "/docs", timeout=2)
-            break
-        except Exception:
-            time.sleep(1)
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
     req_dir = os.path.join(queue, "requests")
     os.makedirs(req_dir, exist_ok=True)
     alive = os.path.join(queue, "alive")
@@ -546,6 +567,13 @@ def serve(queue):
     last = time.time()
     try:
         while True:
+            # QUEUE/unload: free the GPU now (another model in this job needs
+            # it, e.g. the router's icon labelling); the next request reloads
+            if os.path.exists(os.path.join(queue, "unload")):
+                stop_api(api)
+                api = None
+                os.replace(os.path.join(queue, "unload"), os.path.join(queue, "unloaded"))
+                err("[mineru2md] models unloaded on request")
             reqs = sorted(f for f in os.listdir(req_dir) if f.endswith(".json"))
             if not reqs:
                 if os.path.exists(os.path.join(queue, "stop")) or \
@@ -563,6 +591,8 @@ def serve(queue):
                 err(f"[mineru2md] bad request {reqs[0]}: {e}")
                 continue
             t0, rc = time.time(), 0
+            if api is None or api.poll() is not None:
+                api = start_api()
             try:
                 convert(build_parser().parse_args(argv))
             except SystemExit as e:
@@ -578,11 +608,17 @@ def serve(queue):
             last = time.time()
     finally:
         done.set()
-        api.terminate()
-        try:
-            api.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            api.kill()
+        stop_api(api)
+        # nothing of the job's pages outlives it, even when its client was
+        # killed mid-request: drop pending requests and per-request folders
+        import shutil
+        for name in os.listdir(queue):
+            path = os.path.join(queue, name)
+            if name == "requests":
+                for f in os.listdir(path):
+                    os.unlink(os.path.join(path, f))
+            elif os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
         err("[mineru2md] server stopping")
 
 
