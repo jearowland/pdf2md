@@ -103,6 +103,9 @@ def clean_label(text: str) -> str:
     chatty or odd reply can't inject markup into the output."""
     line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
     words = re.sub(r"[^A-Za-z0-9 \-]", " ", line).lower().split()
+    # "bus icon" -> "bus": the output already says [icon: ...]
+    while len(words) > 1 and words[-1] in ("icon", "symbol", "pictogram"):
+        words.pop()
     return " ".join(words[:5])
 
 
