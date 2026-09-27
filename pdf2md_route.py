@@ -106,6 +106,8 @@ def clean_label(text: str) -> str:
     # "bus icon" -> "bus": the output already says [icon: ...]
     while len(words) > 1 and words[-1] in ("icon", "symbol", "pictogram"):
         words.pop()
+    if len(words) > 1 and words[0] in ("a", "an", "the"):
+        words.pop(0)
     return " ".join(words[:5])
 
 
