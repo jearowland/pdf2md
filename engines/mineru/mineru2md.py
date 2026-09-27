@@ -513,8 +513,12 @@ def serve(queue):
     import threading
     import urllib.request
     global API_URL
+    # mineru-api keeps its working files under ./output: run it in a scratch
+    # dir inside the container (the image's /work isn't mounted here, and the
+    # container, scratch included, is gone when the job ends)
     api = subprocess.Popen(["mineru-api", "--host", "127.0.0.1", "--port", str(API_PORT),
                             "--enable-vlm-preload", "true"],
+                           cwd=tempfile.mkdtemp(prefix="mineru-api-"),
                            stdout=open(os.path.join(queue, "api.log"), "w"),
                            stderr=subprocess.STDOUT)
     API_URL = f"http://127.0.0.1:{API_PORT}"
