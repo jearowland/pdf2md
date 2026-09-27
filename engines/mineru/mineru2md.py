@@ -508,7 +508,11 @@ def main():
     convert(build_parser().parse_args(argv))
 
 
-SERVE_IDLE_TIMEOUT = 6 * 3600    # a job that never says stop still ends
+# A server with nothing to do for this long ends itself: the safety net for a
+# job killed outright (SIGKILL), where its own stop never runs and the server
+# would otherwise hold the GPU and its lock. Long enough to span the gaps
+# between a job's OCR requests (text-engine pages, other files).
+SERVE_IDLE_TIMEOUT = 600
 
 
 def serve(queue):

@@ -392,6 +392,11 @@ def main():
     # this document (models load once), unless the caller already runs one
     # for its whole job (PDF2MD_MINERU_SERVER).
     import os
+    import signal
+    # a TERM (a job being stopped) unwinds through the finally below and
+    # stops this document's server; a KILL leaves it to the server's own
+    # idle timeout
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     own_session = None
     if sum(1 for _, _, e in runs if e == "mineru") >= 2 and not os.environ.get("PDF2MD_MINERU_SERVER"):
         own_session = subprocess.run([str(REPO / "tools" / "mineru-session"), "start"],

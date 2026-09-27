@@ -54,10 +54,13 @@ case "${1:-}" in
   run)
     shift; [ "${1:-}" = "--" ] && shift
     q="$(start)"
-    rc=0
-    PDF2MD_MINERU_SERVER="$q" "$@" || rc=$?
-    stop "$q"
-    exit "$rc"
+    # stopped however this ends (normal exit, Ctrl-C, TERM, hang-up); a SIGKILL
+    # can't be trapped, so the server's own idle timeout covers that
+    trap 'stop "$q"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    PDF2MD_MINERU_SERVER="$q" "$@"
     ;;
   *) sed -n '2,7p' "$0" >&2; exit 2 ;;
 esac
