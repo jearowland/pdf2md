@@ -584,6 +584,10 @@ def serve(queue):
             path = os.path.join(req_dir, reqs[0])
             rid = reqs[0][:-5]
             try:
+                queued = time.time() - os.path.getmtime(path)
+            except OSError:
+                queued = 0.0
+            try:
                 with open(path, encoding="utf-8") as f:
                     argv = json.load(f)
                 os.unlink(path)
@@ -591,8 +595,10 @@ def serve(queue):
                 err(f"[mineru2md] bad request {reqs[0]}: {e}")
                 continue
             t0, rc = time.time(), 0
+            api_start = 0.0
             if api is None or api.poll() is not None:
                 api = start_api()
+                api_start = time.time() - t0
             try:
                 convert(build_parser().parse_args(argv))
             except SystemExit as e:
@@ -603,7 +609,8 @@ def serve(queue):
             os.makedirs(os.path.join(queue, rid), exist_ok=True)
             tmp = os.path.join(queue, rid, "status.json.tmp")
             with open(tmp, "w") as f:
-                json.dump({"rc": rc, "secs": round(time.time() - t0, 1)}, f)
+                json.dump({"rc": rc, "secs": round(time.time() - t0, 1),
+                           "queued": round(queued, 1), "api_start": round(api_start, 1)}, f)
             os.replace(tmp, os.path.join(queue, rid, "status.json"))
             last = time.time()
     finally:

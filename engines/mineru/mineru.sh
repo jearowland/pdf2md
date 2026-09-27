@@ -59,6 +59,7 @@ if [ -n "${PDF2MD_MINERU_SERVER:-}" ] && [ -d "$PDF2MD_MINERU_SERVER/requests" ]
       sleep 1
     done
     STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rc"])' "$Q/$ID/status.json")"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(f"[mineru.sh] server: queued {d.get(\"queued\")}s, model load {d.get(\"api_start\")}s, total {d.get(\"secs\")}s", file=sys.stderr)' "$Q/$ID/status.json" || true
     STEM_OUT="${OUT%.md}"
     for f in "$OUT" "$STEM_OUT.content_list.json" "$STEM_OUT.middle.json"; do
       [ -f "$Q/$ID/$f" ] && cp "$Q/$ID/$f" "$DIR/$f"

@@ -112,13 +112,43 @@ def clean_label(text: str) -> str:
     return " ".join(words[:5])
 
 
-def free_mineru_gpu(timeout: int = 180) -> bool:
-    """Ask this job's MinerU server (if one is running) to unload its models
-    and wait until it has: one GPU model at a time. With both loaded, a
-    24 GB card peaked at 23.9 GB in testing, and a 12 GB card would run out."""
+def gpu_free_mb() -> int | None:
+    """Free VRAM on this host's GPU (MiB), or None if it can't be read."""
+    for smi in ("nvidia-smi", "/usr/lib/wsl/lib/nvidia-smi"):
+        try:
+            out = subprocess.run([smi, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            return int(out.split()[0])
+        except Exception:
+            continue
+    return None
+
+
+def ollama_model_mb(url: str, model: str) -> int | None:
+    """The Ollama model's size on disk (MiB), or None."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/tags", timeout=10) as resp:
+            for m in json.loads(resp.read()).get("models", []):
+                if m.get("name") == model or m.get("model") == model:
+                    return int(m["size"] / 2**20)
+    except Exception:
+        pass
+    return None
+
+
+def free_mineru_gpu(need_mb: int | None, timeout: int = 180) -> bool:
+    """Make room on the GPU for a model needing need_mb: if this job's MinerU
+    server is loaded and free VRAM is short (or unknown), ask it to unload
+    and wait until it has. When both fit (titan: MinerU ~15 GB plus the
+    vision model ~7.5 GB on 24 GB), nothing is unloaded -- a reload costs
+    ~46 s. A 12 GB card can't hold both and would run out."""
     import os
     q = os.environ.get("PDF2MD_MINERU_SERVER", "")
     if not q or not Path(q, "requests").is_dir() or Path(q, "exited").exists():
+        return True
+    free = gpu_free_mb()
+    if need_mb is not None and free is not None and free >= need_mb:
         return True
     Path(q, "unloaded").unlink(missing_ok=True)
     Path(q, "unload").touch()
@@ -290,10 +320,15 @@ def table_rows_per_page(md: str, total_pages: int) -> dict[int, int]:
     return counts
 
 
+RUN_SECS: list[dict] = []   # per-run wall time, for the manifest's timings
+
+
 def convert_runs(runs, pdf, pc, workdir, stem, labels, args):
     """Slice each run out and convert it through its engine; [(run, md)]."""
     parts: list[tuple[tuple[int, int, str], Path]] = []
+    RUN_SECS.clear()
     for a, b, eng in runs:
+        t_run = time.time()
         if (a, b) == (1, pc):
             piece_pdf = pdf                      # fast path: no slice needed
         else:
@@ -318,6 +353,7 @@ def convert_runs(runs, pdf, pc, workdir, stem, labels, args):
             subprocess.run([str(MINERU_SH), str(piece_pdf),
                             "-o", piece_md.name], check=True)
         parts.append(((a, b, eng), piece_md))
+        RUN_SECS.append({"pages": [a, b], "engine": eng, "secs": round(time.time() - t_run, 1)})
     return parts
 
 
@@ -343,6 +379,13 @@ def main():
     args = ap.parse_args()
 
     t0 = time.time()
+    timings: dict = {}
+    last = [t0]
+
+    def mark(name):
+        now = time.time()
+        timings[name] = round(now - last[0], 1)
+        last[0] = now
     pdf = Path(args.input).resolve()
     out_md = Path(args.output).resolve()
     workdir = pdf.parent
@@ -358,6 +401,7 @@ def main():
                               f"/work/{stem}.derotated.pdf"], args.dev_bind)
         pdf = workdir / f"{stem}.derotated.pdf"
 
+    mark("derotate")
     # 1b. the copy every engine converts: text hidden under opaque rectangles
     # (cosmetic redactions, text under a panel) removed -- an OCR engine reads
     # only what renders, a text-layer engine would read it all -- and ligature
@@ -374,6 +418,7 @@ def main():
     for f in prepared["ligature_fixes"]:
         err(f"[route] font {f['font']}: {len(f['glyphs'])} ligature glyph(s) given their text back")
 
+    mark("prepare")
     # 2. per-page classification (facts only)
     r = docker_text(workdir, [f"/work/{pdf.name}", "--classify-pages", "--quiet"],
                     args.dev_bind, capture=True)
@@ -385,6 +430,7 @@ def main():
     err(f"[route] {pc} pages -> {len(runs)} run(s): " +
         ", ".join(f"p{a}-{b}:{e}" for a, b, e in runs))
 
+    mark("classify")
     # 3b. alt text for icons on text-engine pages (opt-in): crop them in the
     # container, label them here on the host, hand each text run its labels
     labels: list[dict] = []
@@ -397,7 +443,10 @@ def main():
         text_pages = {p for a, b, eng in runs if eng == "text" for p in range(a, b + 1)}
         icons = [i for i in json.loads(r.stdout[r.stdout.find("["):] or "[]")
                  if i["page"] in text_pages]
-        if icons and free_mineru_gpu():
+        size = ollama_model_mb(args.alt_text_ollama, args.alt_text_model)
+        # the model's weights plus room to run it (context, image tokens)
+        need = int(size * 1.3) + 512 if size else None
+        if icons and free_mineru_gpu(need):
             labels = label_icons(icon_dir, icons, args.alt_text_ollama, args.alt_text_model)
             err(f"[route] alt text: {sum(1 for l in labels if l['label'])} of "
                 f"{len(labels)} icon(s) labelled")
@@ -406,6 +455,7 @@ def main():
                 f.unlink()
             icon_dir.rmdir()
 
+    mark("alt_text")
     # 4. convert each run. Two or more MinerU runs share one MinerU server for
     # this document (models load once), unless the caller already runs one
     # for its whole job (PDF2MD_MINERU_SERVER).
@@ -429,7 +479,8 @@ def main():
             subprocess.run([str(REPO / "tools" / "mineru-session"), "stop", own_session], check=False)
             del os.environ["PDF2MD_MINERU_SERVER"]
 
-    # 5. merge
+    mark("convert")
+    timings["runs"] = RUN_SECS[:]
     # 5. merge with global page numbering. Markers sit BETWEEN pages inside a
     # chunk; at each chunk boundary we add the boundary page's marker
     # explicitly (except before global page 1) so global numbering never
@@ -516,6 +567,7 @@ def main():
     man_path = out_md.with_suffix(".manifest.json")
     man_path.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
 
+    mark("merge_and_checks")
     # 7. number-preservation check (unchanged from auto.sh, report-only)
     try:
         subprocess.run(["docker", "run", "--rm", "-v", f"{workdir}:/work",
@@ -539,6 +591,12 @@ def main():
             piece_pdf.unlink(missing_ok=True)
             (workdir / f"{stem}.p{a:04d}-{b:04d}.icon-labels.json").unlink(missing_ok=True)
 
+    mark("verify_numbers")
+    manifest["timings"] = timings
+    man_path.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    err("[route] timings (s): " + ", ".join(f"{k} {v}" for k, v in timings.items() if k != "runs")
+        + "; runs " + ", ".join(f"p{r['pages'][0]}-{r['pages'][1]} {r['engine']} {r['secs']}"
+                               for r in timings["runs"]))
     err(f"[route] wrote {out_md} + {man_path.name} "
         f"({len(warnings)} warning(s)) in {time.time()-t0:.1f}s")
 
