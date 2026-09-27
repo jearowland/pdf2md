@@ -49,7 +49,10 @@ sys.path.insert(0, str(REPO))
 import pdf2md_route as route  # noqa: E402
 
 TEXT_WORKER_MB = 1500      # one text-engine container's working set, with headroom
-MINERU_MB = 20 * 1024      # the MinerU container's memory cap (mineru.sh)
+# RAM set aside for the MinerU container while CPU workers share the machine
+# with it: its measured peak was 5.8 GB (its hard cap, 20 GB, is a limit, not
+# its use -- reserving the cap left most CPU threads idle during OCR)
+MINERU_MB = 8 * 1024
 RESERVE_MB = 2048          # left for the host itself
 
 
