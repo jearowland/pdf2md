@@ -243,7 +243,7 @@ merge, manifest and checks in parallel. Each document's output is exactly what
 
 ## MinerU start-up: one server per job
 
-A fresh MinerU container spends ~30 s loading models before seconds of GPU
+A fresh MinerU container spends ~60 s loading models (measured on real batches: 57-69 s) before seconds of GPU
 work, so a document with several scanned stretches, a batch of files or a UAT
 run was mostly model loading. `tools/mineru-session` runs one MinerU for a
 whole job instead (`mineru2md.py --serve`, calling MinerU in-process so its
@@ -260,6 +260,24 @@ MinerU runs; `tools/uat.py --remote` starts one for the whole run. With starts
 cheap, a page with a healthy text layer is no longer folded into a
 whole-document MinerU run: on a report of 35 scanned and 5 digital pages,
 that run lost the digital pages outright.
+
+### One MinerU request per document, sized to the machine
+
+A document's OCR runs used to go to MinerU one request each: a caller measured
+3.8 requests per document (most of them a single page) at a fixed ~10 s each,
+beyond the model load. Now `pdf2md.py --combine` puts all of a document's OCR
+pages into one PDF, with a blank page between runs so pages that aren't
+adjacent in the document never look adjacent to MinerU (it joins tables and
+paragraphs across consecutive pages). `mineru2md --runs` sends it through
+MinerU once, both passes at the same time, and renders each run from its own
+pages with MinerU's own builders, the same way the CLI renders a document,
+so each run's output is what a PDF of just its pages would have given.
+
+At MinerU's defaults (3 requests at once, each holding a 64-page window of
+page images) its API outgrew a fixed 20 GB cap and was killed mid-batch.
+`engines/mineru/mineru-limits.sh` now keeps 16 pages in flight, 2 requests at
+once, and caps the container at this machine's RAM less 7 GB (at most 24 GB);
+`pdf2md_batch.py` sizes its CPU workers during OCR from what that leaves.
 
 ## Regression testing
 

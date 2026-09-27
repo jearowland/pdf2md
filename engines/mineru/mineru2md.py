@@ -249,13 +249,43 @@ def insert_page_markers(md, content_list_json, log):
 
 # --serve sets this: every mineru call goes to one mineru-api the server keeps
 # running for the whole job (inside its own container, on loopback), instead
-# of each call starting a temporary one -- which is what cost ~30 s of model
+# of each call starting a temporary one -- which is what cost ~60 s of model
 # loading per call. Same CLI, same API code, so the same output as a one-shot
 # run. (Calling MinerU's do_parse directly was tried first: it skipped some of
 # the CLI path's preparation and turned a pasted balance sheet into
 # "[Illegible]".)
 API_URL = None
 API_PORT = 8000
+
+
+def _page_count(path):
+    """Pages in a PDF, or in every PDF of a directory (for the watchdog)."""
+    files = [os.path.join(path, f) for f in os.listdir(path) if f.endswith(".pdf")] \
+        if os.path.isdir(path) else [path]
+    total = 0
+    for f in files:
+        try:
+            import pypdfium2
+            total += len(pypdfium2.PdfDocument(f))
+        except Exception:
+            total += 50
+    return total
+
+
+def _run_cli(cmd, backend, path, log):
+    """One mineru CLI call, with a stall watchdog: 15 minutes plus 20 s per
+    page. MinerU's API deadlocked on a real job (several tasks stuck in its
+    layout model at once, spinning, for 30+ minutes); without a limit the
+    whole job hung. Past the limit the call is killed and counted failed.
+    Returns the CompletedProcess, or None on a timeout."""
+    limit = 900 + 20 * _page_count(path)
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              timeout=limit)
+    except subprocess.TimeoutExpired:
+        err(f"[mineru2md] ERROR: mineru ({backend}) made no finish in {limit}s -- stopped "
+            f"(stalled MinerU); its documents fail")
+        return None
 
 
 def run_mineru(input_path, method, backend, lang, log, want_content_list=False,
@@ -303,7 +333,9 @@ def run_mineru(input_path, method, backend, lang, log, want_content_list=False,
             cmd += ["--api-url", API_URL]
         log(f"[mineru2md] running: {' '.join(cmd)}")
 
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = _run_cli(cmd, backend, input_path, log)
+        if proc is None:
+            sys.exit(4)
         if proc.returncode != 0:
             err(f"[mineru2md] ERROR: mineru ({backend}) exited {proc.returncode}")
             err(proc.stderr[-2000:] if proc.stderr else "(no stderr)")
@@ -491,6 +523,10 @@ def build_parser():
                          "in this repo yet, off by default (adds no runtime cost either way -- "
                          "MinerU always writes this file, this flag only controls whether the "
                          "wrapper preserves it before the temp directory is discarded).")
+    ap.add_argument("--runs", metavar="RUNS.json",
+                    help="the input combines several runs of one document (pdf2md.py "
+                         "--combine): [{out, first, last}]; each run is rendered from its own "
+                         "pages and written as <out> beside -o")
     ap.add_argument("--quiet", action="store_true", help="suppress stderr logs")
     return ap
 
@@ -626,6 +662,10 @@ def serve(queue):
                 convert(build_parser().parse_args(argv))
             except SystemExit as e:
                 rc = e.code if isinstance(e.code, int) else 1
+                # the API may be what failed (a stalled task is still in it):
+                # the next request gets a fresh one
+                stop_api(api)
+                api = None
             except Exception as e:
                 err(f"[mineru2md] request {rid} failed: {e!r}")
                 rc = 1
@@ -652,6 +692,45 @@ def serve(queue):
         err("[mineru2md] server stopping")
 
 
+def render_pages(middle_json, first, last, backend):
+    """(markdown, content_list_json) for pages first..last (0-indexed) of a
+    MinerU run, rendered by MinerU's own builders from its intermediate JSON
+    -- exactly how the mineru CLI renders a whole document, so a range comes
+    out as it would have from a PDF of just those pages. Page numbers are
+    rebased to the range."""
+    import copy
+    import json
+    from mineru.utils.enum_class import MakeMode
+    if backend == "pipeline":
+        from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make
+    else:   # vlm-* and hybrid-* backends render through the vlm builder
+        from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make
+    pages = copy.deepcopy(json.loads(middle_json)["pdf_info"][first:last + 1])
+    for i, page in enumerate(pages):
+        page["page_idx"] = i
+    md = union_make(pages, MakeMode.MM_MD, "images")
+    content_list = union_make(pages, MakeMode.CONTENT_LIST, "images")
+    return md, json.dumps(content_list, ensure_ascii=False, indent=4)
+
+
+def finish_runs(runs, main, ref, backend, ref_backend, out_dir, log):
+    """Split one combined document's results back into its runs (see
+    pdf2md.py --combine) and finish each exactly as a single conversion:
+    runs is [{"out": "<name>.md", "first": i, "last": j}], main/ref the
+    (md, content_list, images, middle_json) of the main and reference passes."""
+    _, _, images, middle_json = main
+    if not middle_json:
+        err("[mineru2md] ERROR: no middle.json from the main pass; can't split runs")
+        sys.exit(4)
+    for run in runs:
+        md, content_list = render_pages(middle_json, run["first"], run["last"], backend)
+        ref_md = None
+        if ref and ref[3]:
+            ref_md, _ = render_pages(ref[3], run["first"], run["last"], ref_backend)
+        run_images = {k: v for k, v in (images or {}).items() if f"images/{k}" in md}
+        finish(md, content_list, run_images, None, ref_md, os.path.join(out_dir, run["out"]), log)
+
+
 def run_mineru_batch(in_dir, method, backend, lang, log, want_middle_json=False):
     """One MinerU call over every PDF in in_dir (the CLI batches and runs
     them concurrently against one API, so vLLM gets many pages at once);
@@ -665,7 +744,9 @@ def run_mineru_batch(in_dir, method, backend, lang, log, want_middle_json=False)
         if API_URL:
             cmd += ["--api-url", API_URL]
         log(f"[mineru2md] running on {len(stems)} document(s): {' '.join(cmd)}")
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = _run_cli(cmd, backend, in_dir, log)
+        if proc is None:
+            return {stem: None for stem in stems}
         if proc.returncode != 0:
             # some documents may still have come through; each is checked below
             err(f"[mineru2md] WARNING: mineru ({backend}) exited {proc.returncode}")
@@ -683,30 +764,37 @@ def convert_batch(in_dir, out_dir, args):
         if not args.quiet:
             err(*a)
     os.makedirs(out_dir, exist_ok=True)
-    # one mineru-api for the whole batch, and the main and reference passes
-    # sent to it at the same time: models load once (not once per CLI call)
-    # and the GPU works on both passes together
-    from concurrent.futures import ThreadPoolExecutor
+    # one mineru-api for the whole batch (models load once, not once per CLI
+    # call); the main and reference passes go to it one after the other --
+    # running them at once put several tasks into MinerU's layout model
+    # together, and on a real job they deadlocked there
     api = start_api(out_dir)
     try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            main_f = pool.submit(run_mineru_batch, in_dir, args.method, args.backend, args.lang,
-                                 log, want_middle_json=args.middle_json)
-            ref_f = None
-            if args.reconcile and args.backend != args.reconcile_backend:
-                ref_f = pool.submit(run_mineru_batch, in_dir, args.method,
-                                    args.reconcile_backend, args.lang, log)
-            main_pass = main_f.result()
-            ref_pass = ref_f.result() if ref_f else {}
+        main_pass = run_mineru_batch(in_dir, args.method, args.backend, args.lang, log,
+                                     want_middle_json=True)
+        ref_pass = {}
+        if args.reconcile and args.backend != args.reconcile_backend:
+            ref_pass = run_mineru_batch(in_dir, args.method, args.reconcile_backend, args.lang,
+                                        log, want_middle_json=True)
     finally:
         stop_api(api)
     failed = 0
     for stem, res in main_pass.items():
         if res is None:
+            err(f"[mineru2md] batch: {stem}: no output from mineru ({args.backend})")
             failed += 1
             continue
         md, content_list_json, images, middle_json = res
         ref = ref_pass.get(stem)
+        runs_path = os.path.join(in_dir, stem + ".runs.json")
+        if os.path.exists(runs_path):
+            import json
+            with open(runs_path, encoding="utf-8") as f:
+                runs = json.load(f)
+            os.makedirs(os.path.join(out_dir, stem), exist_ok=True)
+            finish_runs(runs, res, ref, args.backend, args.reconcile_backend,
+                        os.path.join(out_dir, stem), log)
+            continue
         finish(md, content_list_json, images, middle_json, ref[0] if ref else None,
                os.path.join(out_dir, stem + ".md"), log)
     log(f"[mineru2md] batch: {len(main_pass) - failed} of {len(main_pass)} document(s) converted")
@@ -726,6 +814,25 @@ def convert(args):
 
     t0 = time.time()
     log("[mineru2md] (first run lazy-downloads MinerU models to the mounted cache)")
+    if args.runs:
+        # one combined document (pdf2md.py --combine): both passes at once,
+        # then each run rendered from its own pages and finished on its own
+        import json
+        with open(args.runs, encoding="utf-8") as f:
+            runs = json.load(f)
+        # passes one after the other (see convert_batch: concurrent tasks
+        # deadlocked MinerU's layout model on a real job)
+        main = run_mineru(args.input, args.method, args.backend, args.lang, log,
+                          want_content_list=True, want_images=True, want_middle_json=True)
+        ref = None
+        if args.reconcile and args.backend != args.reconcile_backend:
+            ref = run_mineru(args.input, args.method, args.reconcile_backend, args.lang, log,
+                             want_middle_json=True)
+        out_dir = os.path.dirname(os.path.abspath(args.output)) if args.output else os.getcwd()
+        finish_runs(runs, main, ref, args.backend, args.reconcile_backend, out_dir, log)
+        log(f"[mineru2md] {len(runs)} run(s) in {time.time()-t0:.1f}s")
+        return
+
     md, content_list_json, images, middle_json = run_mineru(
         args.input, args.method, args.backend, args.lang, log,
         want_content_list=True, want_images=True, want_middle_json=args.middle_json)

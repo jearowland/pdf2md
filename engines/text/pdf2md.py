@@ -1343,6 +1343,11 @@ def main():
                          "and exit. A pure page copy (no re-rendering, annotations and "
                          "resources preserved); used by pdf2md_route.py to hand each "
                          "same-class page run to its engine.")
+    ap.add_argument("--combine", metavar="A-B,C-D,...",
+                    help="write these page ranges (1-indexed, inclusive) to one PDF at -o, "
+                         "a blank page between ranges, print where each range landed "
+                         "(0-indexed first/last page) as JSON, and exit. Used to send all of "
+                         "a document's OCR pages to MinerU as one document.")
     ap.add_argument("--derotate", metavar="OUTPUT.pdf",
                     help="detect per-page rotation via Tesseract OSD and write a corrected copy "
                          "to OUTPUT.pdf, then exit. Only the /Rotate flag is changed -- no pixel "
@@ -1414,6 +1419,40 @@ def main():
             print(json.dumps(extract_icons(args.input, args.extract_icons)))
         except Exception as e:
             err(f"[pdf2md] ERROR during --extract-icons: {e}")
+            sys.exit(6)
+        return
+
+    if args.combine:
+        if not args.output:
+            err("[pdf2md] ERROR: --combine requires -o OUTPUT.pdf")
+            sys.exit(2)
+        try:
+            import json
+            import pymupdf
+            src = pymupdf.open(args.input)
+            ranges = [tuple(int(x) for x in r.split("-", 1)) for r in args.combine.split(",")]
+            dst = pymupdf.open()
+            layout = []
+            for i, (a, b) in enumerate(ranges):
+                if not (1 <= a <= b <= len(src)):
+                    err(f"[pdf2md] ERROR: --combine range {a}-{b} out of range (1-{len(src)})")
+                    sys.exit(2)
+                if i:
+                    # a blank page between ranges: pages that aren't adjacent
+                    # in the document mustn't look adjacent to the OCR engine,
+                    # or it joins a table or paragraph across the gap
+                    prev = src[ranges[i - 1][1] - 1].rect
+                    dst.new_page(width=prev.width, height=prev.height)
+                first = len(dst)
+                dst.insert_pdf(src, from_page=a - 1, to_page=b - 1)
+                layout.append({"pages": [a, b], "first": first, "last": len(dst) - 1})
+            dst.save(args.output)
+            print(json.dumps(layout))
+            log(f"[pdf2md] --combine: wrote {len(ranges)} range(s), {len(dst)} page(s) -> {args.output}")
+        except SystemExit:
+            raise
+        except Exception as e:
+            err(f"[pdf2md] ERROR during --combine: {e}")
             sys.exit(6)
         return
 

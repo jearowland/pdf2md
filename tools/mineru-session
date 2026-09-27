@@ -5,7 +5,7 @@
 #   tools/mineru-session stop QUEUE      let it finish what's queued, stop it, delete the queue dir
 #   tools/mineru-session run -- CMD...   start, run CMD with PDF2MD_MINERU_SERVER set, stop (whatever CMD's exit)
 #
-# Each fresh MinerU container spends ~30 s loading models before seconds of GPU work, so a job
+# Each fresh MinerU container spends ~60 s loading models before seconds of GPU work, so a job
 # with many OCR runs (several scanned stretches in one document, a batch of files, a UAT run)
 # was mostly model loading. While PDF2MD_MINERU_SERVER is set, engines/mineru/mineru.sh hands
 # its work to this server instead of starting a container. The server container is hardened like
@@ -15,6 +15,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 LOCK_FILE="${PDF2MD_MINERU_LOCK:-/tmp/pdf2md-mineru.lock}"
 MODELS="${MINERU_MODELS:-$HOME/.cache/mineru-models}"
+source "$REPO/engines/mineru/mineru-limits.sh"   # MINERU_LIMITS, as mineru.sh
 
 prune() {
   # queue dirs left by jobs killed outright: the server has exited (or its
@@ -42,7 +43,7 @@ start() {
       -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
       --network none --shm-size 32g \
       --cap-drop ALL --security-opt no-new-privileges \
-      --pids-limit 4096 --memory 20g \
+      --pids-limit 4096 "${MINERU_LIMITS[@]}" \
       -v "$MODELS":/models \
       -v "$q":/q \
       pdf2md-mineru --serve /q >"$q/server.log" 2>&1

@@ -403,12 +403,29 @@ def analyze(input_path: str, output_path: str, opts) -> dict:
            "pdf": pdf, "pc": pc, "per_page": per_page, "runs": runs, "covered": covered,
            "prepared": prepared, "icons": [], "labels": [], "chunks": {},
            "timings": {}, "t0": t0}
-    # slices for every run that isn't the whole document
+    # text runs: a slice each (unless the run is the whole document)
     for a, b, eng in runs:
         piece_pdf, _ = piece_paths(doc, a, b)
-        if piece_pdf != pdf:
+        if eng == "text" and piece_pdf != pdf:
             docker_text(workdir, [f"/work/{pdf.name}", "--slice", f"{a}-{b}",
                                   "-o", f"/work/{piece_pdf.name}"], opts.dev_bind)
+    # OCR runs: ONE combined PDF for MinerU (a blank page between runs, so
+    # pages that aren't adjacent in the document don't look adjacent), with
+    # a map saying which of its pages is which run; MinerU renders each run
+    # from its own pages. One MinerU request per document instead of one
+    # per run (a caller measured 3.8 requests/document, most of them a
+    # single page, each paying a fixed cost).
+    ocr_runs = [(a, b) for a, b, eng in runs if eng == "mineru"]
+    if ocr_runs:
+        combined = workdir / f"{stem}.ocr.pdf"
+        r = docker_text(workdir, [f"/work/{pdf.name}", "--combine",
+                                  ",".join(f"{a}-{b}" for a, b in ocr_runs),
+                                  "-o", f"/work/{combined.name}", "--quiet"],
+                        opts.dev_bind, capture=True)
+        layout = json.loads(r.stdout[r.stdout.find("["):])
+        doc["ocr"] = {"pdf": combined, "runs": [
+            {"out": piece_paths(doc, *l["pages"])[1].name, "first": l["first"], "last": l["last"]}
+            for l in layout]}
     # 3b. icons on text-engine pages (alt text, opt-in): cropped here; the
     # labels come later, in one pass, once the GPU is free of MinerU
     if opts.alt_text_ollama and any(eng == "text" for _, _, eng in runs):
@@ -441,16 +458,28 @@ def convert_text_run(doc: dict, run: tuple, opts) -> None:
     doc["chunks"][(a, b)] = {"engine": "text", "secs": round(time.time() - t, 1)}
 
 
-def convert_mineru_run(doc: dict, run: tuple) -> None:
-    """One MinerU run on its own (single-document path): via mineru.sh, so the
-    host-wide GPU lock applies and a job's server is used if there is one.
-    -o is forwarded into the container verbatim and must be relative to the
-    input's directory (mounted as /work)."""
-    a, b, _ = run
+def convert_mineru_doc(doc: dict) -> None:
+    """All of a document's OCR runs in one MinerU request (single-document
+    path): the combined PDF from analyze, via mineru.sh -- so the host-wide
+    GPU lock applies and a job's MinerU server is used if there is one --
+    with --runs, which writes each run's chunk .md beside it. Paths are
+    relative to the input's directory (mounted as /work)."""
+    ocr = doc.get("ocr")
+    if not ocr:
+        return
     t = time.time()
-    piece_pdf, piece_md = piece_paths(doc, a, b)
-    subprocess.run([str(MINERU_SH), str(piece_pdf), "-o", piece_md.name], check=True)
-    doc["chunks"][(a, b)] = {"engine": "mineru", "secs": round(time.time() - t, 1)}
+    runs_path = doc["workdir"] / f"{doc['stem']}.ocr.runs.json"
+    runs_path.write_text(json.dumps(ocr["runs"]), encoding="utf-8")
+    subprocess.run([str(MINERU_SH), str(ocr["pdf"]), "-o", f"{doc['stem']}.ocr.md",
+                    "--runs", runs_path.name], check=True)
+    missing = [r["out"] for r in ocr["runs"] if not (doc["workdir"] / r["out"]).exists()]
+    if missing:
+        raise RuntimeError(f"MinerU wrote no output for run(s) {missing}")
+    secs = round(time.time() - t, 1)
+    for a, b, eng in doc["runs"]:
+        if eng == "mineru":
+            doc["chunks"][(a, b)] = {"engine": "mineru", "secs": secs,
+                                     "combined_runs": len(ocr["runs"])}
 
 
 def label_all_icons(docs: list[dict], opts) -> None:
@@ -585,6 +614,8 @@ def finalize(doc: dict, opts) -> None:
             if piece_pdf != pdf:
                 piece_pdf.unlink(missing_ok=True)
             (workdir / f"{stem}.p{a:04d}-{b:04d}.icon-labels.json").unlink(missing_ok=True)
+        for extra in (f"{stem}.ocr.pdf", f"{stem}.ocr.runs.json"):
+            (workdir / extra).unlink(missing_ok=True)
         icon_dir = doc.get("icon_dir")
         if icon_dir and icon_dir.is_dir():
             for f in icon_dir.glob("*"):
@@ -624,30 +655,11 @@ def main():
     opts = ap.parse_args()
 
     doc = analyze(opts.input, opts.output, opts)
-    # OCR first, then icon labels (the GPU is free of MinerU by then), then
-    # the text runs, which need the labels. Two or more MinerU runs share one
-    # MinerU server for this document (models load once), unless the caller
-    # runs one for its whole job (PDF2MD_MINERU_SERVER; "off" = one-shot).
-    import os
-    import signal
-    # a TERM (a job being stopped) unwinds through the finally below and
-    # stops this document's server; a KILL leaves it to the server's own
-    # idle timeout
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-    ocr_runs = [r for r in doc["runs"] if r[2] == "mineru"]
-    own_session = None
-    if len(ocr_runs) >= 2 and not os.environ.get("PDF2MD_MINERU_SERVER"):
-        own_session = subprocess.run([str(REPO / "tools" / "mineru-session"), "start"],
-                                     check=True, capture_output=True, text=True).stdout.strip()
-        os.environ["PDF2MD_MINERU_SERVER"] = own_session
-        err(f"[route] MinerU server for this document: {own_session}")
-    try:
-        for run in ocr_runs:
-            convert_mineru_run(doc, run)
-    finally:
-        if own_session:
-            subprocess.run([str(REPO / "tools" / "mineru-session"), "stop", own_session], check=False)
-            del os.environ["PDF2MD_MINERU_SERVER"]
+    # OCR first (one MinerU request for all of the document's OCR pages; a
+    # caller's job-wide server is used via PDF2MD_MINERU_SERVER), then icon
+    # labels (the GPU is free of MinerU by then), then the text runs, which
+    # need the labels
+    convert_mineru_doc(doc)
     if opts.alt_text_ollama:
         label_all_icons([doc], opts)
     for run in doc["runs"]:

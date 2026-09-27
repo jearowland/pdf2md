@@ -32,6 +32,7 @@ Exit 1 if any document failed (the others are still written).
 """
 from __future__ import annotations
 import argparse
+import json
 import os
 import re
 import shutil
@@ -49,10 +50,15 @@ sys.path.insert(0, str(REPO))
 import pdf2md_route as route  # noqa: E402
 
 TEXT_WORKER_MB = 1500      # one text-engine container's working set, with headroom
-# RAM set aside for the MinerU container while CPU workers share the machine
-# with it: its measured peak was 5.8 GB (its hard cap, 20 GB, is a limit, not
-# its use -- reserving the cap left most CPU threads idle during OCR)
-MINERU_MB = 8 * 1024
+def mineru_cap_mb() -> int:
+    """The MinerU container's memory cap on this machine, as mineru.sh sets
+    it (engines/mineru/mineru-limits.sh). CPU workers running alongside it
+    are sized from what's left, so the two can never add up to more than
+    the machine has: a smaller reservation (a measured 5.8 GB) let MinerU
+    grow to its 20 GB cap on a real batch and get OOM-killed."""
+    out = subprocess.run(["bash", "-c", f"source {REPO}/engines/mineru/mineru-limits.sh; "
+                          "echo $MINERU_MEMORY_MB"], capture_output=True, text=True).stdout
+    return int(out.strip() or 20480)
 RESERVE_MB = 2048          # left for the host itself
 
 
@@ -90,46 +96,48 @@ def run_pool(fn, items, workers: int, label: str) -> list:
     return failed
 
 
-def gpu_stage(docs: list[dict], job: Path) -> set[str]:
-    """Every document's OCR runs through one MinerU container; each output
-    lands where the single-document path puts it (the run's chunk .md, its
-    content_list.json, images/<chunk stem>/). Returns the inputs of documents
-    whose OCR failed."""
-    ocr = [(d, r) for d in docs for r in d["runs"] if r[2] == "mineru"]
-    if not ocr:
-        return set()
+def gpu_stage(docs: list[dict], job: Path) -> dict[str, str]:
+    """Every document's OCR through ONE MinerU container (models load once;
+    the CLI batches the job's documents together for the GPU). Each document
+    goes in as one combined PDF of its OCR runs (pdf2md_route.analyze) with
+    its run map; each run's output lands where the single-document path
+    puts it (the run's chunk .md, its content_list.json, images/<chunk>/).
+    Returns {input: reason} for documents whose OCR failed."""
+    ocr_docs = [d for d in docs if d.get("ocr")]
+    if not ocr_docs:
+        return {}
     in_dir = job / "in"
     in_dir.mkdir(parents=True)
-    names = {}
-    for i, (d, (a, b, _)) in enumerate(ocr):
-        piece_pdf, piece_md = route.piece_paths(d, a, b)
+    for i, d in enumerate(ocr_docs):
         name = f"{i:04d}"          # unique across documents that share stems
-        shutil.copyfile(piece_pdf, in_dir / f"{name}.pdf")
-        names[name] = (d, a, b, piece_md)
-    route.err(f"[batch] GPU: {len(ocr)} OCR run(s) from "
-              f"{len({id(d) for d, _ in ocr})} document(s) in one MinerU container")
+        shutil.copyfile(d["ocr"]["pdf"], in_dir / f"{name}.pdf")
+        (in_dir / f"{name}.runs.json").write_text(json.dumps(d["ocr"]["runs"]), encoding="utf-8")
+        d["ocr"]["job_name"] = name
+    route.err(f"[batch] GPU: {len(ocr_docs)} document(s), "
+              f"{sum(len(d['ocr']['runs']) for d in ocr_docs)} OCR run(s), one MinerU container")
     t = time.time()
     subprocess.run([str(route.MINERU_SH), "--batch", str(job)], check=False)
-    failed = set()
-    out = job / "out"
-    for name, (d, a, b, piece_md) in names.items():
-        md = out / f"{name}.md"
-        if not md.exists():
-            failed.add(d["input"])
+    failed = {}
+    for d in ocr_docs:
+        out = job / "out" / d["ocr"]["job_name"]
+        missing = [r["out"] for r in d["ocr"]["runs"] if not (out / r["out"]).exists()]
+        if missing:
+            failed[d["input"]] = (f"MinerU wrote no output for OCR run(s) {missing} "
+                                  f"(see the MinerU log above)")
             continue
-        chunk_stem = piece_md.stem
-        text = md.read_text(encoding="utf-8").replace(f"](images/{name}/", f"](images/{chunk_stem}/")
-        piece_md.write_text(text, encoding="utf-8")
-        for suffix in (".content_list.json", ".middle.json"):
-            if (out / f"{name}{suffix}").exists():
-                shutil.copyfile(out / f"{name}{suffix}", d["workdir"] / f"{chunk_stem}{suffix}")
-        if (out / "images" / name).is_dir():
-            dest = d["workdir"] / "images" / chunk_stem
-            dest.mkdir(parents=True, exist_ok=True)
-            for f in (out / "images" / name).iterdir():
-                shutil.copyfile(f, dest / f.name)
-        d["chunks"][(a, b)] = {"engine": "mineru", "secs": round(time.time() - t, 1),
-                               "batched": len(ocr)}
+        for f in out.iterdir():
+            if f.is_file():
+                shutil.copyfile(f, d["workdir"] / f.name)
+        if (out / "images").is_dir():
+            for sub in (out / "images").iterdir():
+                dest = d["workdir"] / "images" / sub.name
+                dest.mkdir(parents=True, exist_ok=True)
+                for f in sub.iterdir():
+                    shutil.copyfile(f, dest / f.name)
+        for a, b, eng in d["runs"]:
+            if eng == "mineru":
+                d["chunks"][(a, b)] = {"engine": "mineru", "secs": round(time.time() - t, 1),
+                                       "batched_documents": len(ocr_docs)}
     return failed
 
 
@@ -171,25 +179,27 @@ def main():
     text_now = [(d, r) for d in docs for r in d["runs"] if r[2] == "text" and not needs_labels(d, r)]
     text_later = [(d, r) for d in docs for r in d["runs"] if r[2] == "text" and needs_labels(d, r)]
     with tempfile.TemporaryDirectory(prefix="pdf2md-batch-", dir=REPO / "tmp") as job:
-        gpu_failed: set[str] = set()
+        gpu_failed: dict[str, str] = {}
 
         def gpu():
             gpu_failed.update(gpu_stage(docs, Path(job)))
         g = threading.Thread(target=gpu)
         g.start()
-        workers = cpu_workers(reserve_mb=MINERU_MB if any(r[2] == "mineru" for d in docs
+        workers = cpu_workers(reserve_mb=mineru_cap_mb() if any(r[2] == "mineru" for d in docs
                                                              for r in d["runs"]) else 0)
         route.err(f"[batch] CPU: {len(text_now)} text run(s) on {workers} worker(s) during OCR")
         failed |= {d["input"] for d, _ in run_pool(lambda dr: route.convert_text_run(dr[0], dr[1], opts),
                                                    text_now, workers, "text run")}
         # documents that need nothing from the GPU finish while it works
         gpu_free = [d for d in docs if d["input"] not in failed
-                    and not any(r[2] == "mineru" for r in d["runs"]) and not d["icons"]]
+                    and not d.get("ocr") and not d["icons"]]
         failed |= {d["input"] for d in run_pool(lambda d: route.finalize(d, opts),
                                                 gpu_free, workers, "finalize")}
         finished = {d["input"] for d in gpu_free}
         g.join()
-        failed |= gpu_failed
+        for inp, why in gpu_failed.items():
+            route.err(f"[batch] {Path(inp).name}: {why}")
+        failed |= set(gpu_failed)
 
     # C. every icon of the job labelled in one pass (MinerU has exited)
     if opts.alt_text_ollama:

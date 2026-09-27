@@ -20,6 +20,7 @@
 # own GPU only needs to coordinate with itself, not across machines.
 LOCK_FILE="${PDF2MD_MINERU_LOCK:-/tmp/pdf2md-mineru.lock}"
 set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/mineru-limits.sh"   # MINERU_LIMITS: memory cap + pages in flight
 
 if [ $# -lt 1 ]; then echo "usage: $0 INPUT.pdf [args...]  |  $0 --batch JOBDIR [args...]" >&2; exit 1; fi
 
@@ -37,7 +38,7 @@ if [ "$1" = "--batch" ]; then
     -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
     --network none --shm-size 32g \
     --cap-drop ALL --security-opt no-new-privileges \
-    --pids-limit 4096 --memory 20g \
+    --pids-limit 4096 "${MINERU_LIMITS[@]}" \
     -v "$MODELS":/models \
     -v "$JOB":/work \
     pdf2md-mineru --batch /work/in /work/out "$@"
@@ -55,10 +56,11 @@ mkdir -p "$MODELS"
 # (the server writes files); without it, fall through to a one-shot container.
 # PDF2MD_MINERU_SERVER=off (no such queue dir) also means one-shot.
 if [ -n "${PDF2MD_MINERU_SERVER:-}" ] && [ -d "$PDF2MD_MINERU_SERVER/requests" ]; then
-  Q="$PDF2MD_MINERU_SERVER"; OUT=""; REST=(); prev=""
+  Q="$PDF2MD_MINERU_SERVER"; OUT=""; RUNS=""; REST=(); prev=""
   for a in "$@"; do
     if [ "$prev" = "-o" ]; then OUT="$a"; prev=""; continue; fi
-    if [ "$a" = "-o" ]; then prev="-o"; continue; fi
+    if [ "$prev" = "--runs" ]; then RUNS="$a"; prev=""; continue; fi
+    if [ "$a" = "-o" ] || [ "$a" = "--runs" ]; then prev="$a"; continue; fi
     REST+=("$a")
   done
   if [ -n "$OUT" ] && [ ! -f "$Q/exited" ]; then
@@ -66,6 +68,10 @@ if [ -n "${PDF2MD_MINERU_SERVER:-}" ] && [ -d "$PDF2MD_MINERU_SERVER/requests" ]
     ID="$(date +%s%N)-$$"
     mkdir -p "$Q/$ID"
     cp "$IN" "$Q/$ID/$BASE"
+    if [ -n "$RUNS" ]; then
+      cp "$DIR/$(basename "$RUNS")" "$Q/$ID/runs.json"
+      REST+=(--runs "/q/$ID/runs.json")
+    fi
     python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' \
       "/q/$ID/$BASE" -o "/q/$ID/$OUT" ${REST[@]+"${REST[@]}"} >"$Q/requests/$ID.json.tmp"
     mv "$Q/requests/$ID.json.tmp" "$Q/requests/$ID.json"
@@ -79,13 +85,15 @@ if [ -n "${PDF2MD_MINERU_SERVER:-}" ] && [ -d "$PDF2MD_MINERU_SERVER/requests" ]
       sleep 1
     done
     STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rc"])' "$Q/$ID/status.json")"
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(f"[mineru.sh] server: queued {d.get(\"queued\")}s, model load {d.get(\"api_start\")}s, total {d.get(\"secs\")}s", file=sys.stderr)' "$Q/$ID/status.json" || true
-    STEM_OUT="${OUT%.md}"
-    for f in "$OUT" "$STEM_OUT.content_list.json" "$STEM_OUT.middle.json"; do
-      [ -f "$Q/$ID/$f" ] && cp "$Q/$ID/$f" "$DIR/$f"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("[mineru.sh] server: queued %ss, model load %ss, total %ss" % (d.get("queued"), d.get("api_start"), d.get("secs")), file=sys.stderr)' "$Q/$ID/status.json" || true
+    # every output the request wrote (one .md per run with --runs), not the
+    # input copy or the bookkeeping
+    for f in "$Q/$ID"/*; do
+      case "$(basename "$f")" in "$BASE"|status.json|runs.json|images) continue ;; esac
+      cp "$f" "$DIR/"
     done
-    if [ -d "$Q/$ID/images/$STEM_OUT" ]; then
-      mkdir -p "$DIR/images/$STEM_OUT" && cp -r "$Q/$ID/images/$STEM_OUT/." "$DIR/images/$STEM_OUT/"
+    if [ -d "$Q/$ID/images" ]; then
+      mkdir -p "$DIR/images" && cp -r "$Q/$ID/images/." "$DIR/images/"
     fi
     rm -rf "$Q/$ID"
     exit "$STATUS"
@@ -116,7 +124,7 @@ flock "$LOCK_FILE" docker run --rm --gpus all \
   -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
   --network none --shm-size 32g \
   --cap-drop ALL --security-opt no-new-privileges \
-  --pids-limit 4096 --memory 20g \
+  --pids-limit 4096 "${MINERU_LIMITS[@]}" \
   -v "$MODELS":/models \
   -v "$DIR":/work \
   pdf2md-mineru "/work/$BASE" "$@"
