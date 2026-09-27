@@ -30,6 +30,46 @@ BASE="$(basename "$IN")"
 MODELS="${MINERU_MODELS:-$HOME/.cache/mineru-models}"
 mkdir -p "$MODELS"
 
+# A job's MinerU server (tools/mineru-session) is running: hand this document to
+# it instead of starting a container, so the models don't load again. Needs -o
+# (the server writes files); without it, fall through to a one-shot container.
+if [ -n "${PDF2MD_MINERU_SERVER:-}" ] && [ -d "$PDF2MD_MINERU_SERVER/requests" ]; then
+  Q="$PDF2MD_MINERU_SERVER"; OUT=""; REST=(); prev=""
+  for a in "$@"; do
+    if [ "$prev" = "-o" ]; then OUT="$a"; prev=""; continue; fi
+    if [ "$a" = "-o" ]; then prev="-o"; continue; fi
+    REST+=("$a")
+  done
+  if [ -n "$OUT" ] && [ ! -f "$Q/exited" ]; then
+    OUT="$(basename "$OUT")"
+    ID="$(date +%s%N)-$$"
+    mkdir -p "$Q/$ID"
+    cp "$IN" "$Q/$ID/$BASE"
+    python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' \
+      "/q/$ID/$BASE" -o "/q/$ID/$OUT" ${REST[@]+"${REST[@]}"} >"$Q/requests/$ID.json.tmp"
+    mv "$Q/requests/$ID.json.tmp" "$Q/requests/$ID.json"
+    echo "[mineru.sh] queued on the job's MinerU server ($Q)" >&2
+    while [ ! -f "$Q/$ID/status.json" ]; do
+      if [ -f "$Q/exited" ]; then
+        echo "[mineru.sh] ERROR: the job's MinerU server stopped; see $Q/server.log" >&2
+        tail -20 "$Q/server.log" >&2 || true
+        exit 4
+      fi
+      sleep 1
+    done
+    STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rc"])' "$Q/$ID/status.json")"
+    STEM_OUT="${OUT%.md}"
+    for f in "$OUT" "$STEM_OUT.content_list.json" "$STEM_OUT.middle.json"; do
+      [ -f "$Q/$ID/$f" ] && cp "$Q/$ID/$f" "$DIR/$f"
+    done
+    if [ -d "$Q/$ID/images/$STEM_OUT" ]; then
+      mkdir -p "$DIR/images/$STEM_OUT" && cp -r "$Q/$ID/images/$STEM_OUT/." "$DIR/images/$STEM_OUT/"
+    fi
+    rm -rf "$Q/$ID"
+    exit "$STATUS"
+  fi
+fi
+
 echo "[mineru.sh] waiting for GPU lock ($LOCK_FILE)..." >&2
 # NOT running as --user here (unlike the other engines) -- confirmed a real,
 # live failure when tried: MinerU's model-config lookup

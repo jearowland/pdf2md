@@ -247,6 +247,31 @@ def insert_page_markers(md, content_list_json, log):
     return "".join(out), n_inserted
 
 
+# --serve sets this: MinerU is called in this process (mineru.cli.common's
+# do_parse, the same function the mineru CLI ends up in), so its models load
+# once and stay loaded for every request of the job. The one-shot path keeps
+# the CLI.
+IN_PROCESS = False
+
+
+def _parse_in_process(input_path, outdir, method, backend, lang, log):
+    """MinerU's own do_parse into outdir: the same <stem>/<method>/ tree and
+    files the mineru CLI writes, so run_mineru reads them the same way."""
+    from mineru.cli.common import do_parse
+    stem = os.path.splitext(os.path.basename(input_path))[0]
+    with open(input_path, "rb") as f:
+        pdf_bytes = f.read()
+    log(f"[mineru2md] in-process do_parse: {os.path.basename(input_path)} "
+        f"backend={backend} method={method}")
+    try:
+        do_parse(outdir, [stem], [pdf_bytes], [lang or "ch"], backend=backend,
+                 parse_method=method, f_draw_layout_bbox=False, f_draw_span_bbox=False,
+                 f_dump_model_output=False, f_dump_orig_pdf=False)
+    except Exception as e:
+        err(f"[mineru2md] ERROR: mineru ({backend}) failed in-process: {e!r}")
+        sys.exit(4)
+
+
 def run_mineru(input_path, method, backend, lang, log, want_content_list=False,
                 want_images=False, want_middle_json=False):
     """Run MinerU once with the given backend, return
@@ -285,16 +310,19 @@ def run_mineru(input_path, method, backend, lang, log, want_content_list=False,
     anything in this repo."""
     t0 = time.time()
     with tempfile.TemporaryDirectory() as outdir:
-        cmd = ["mineru", "-p", input_path, "-o", outdir, "-m", method, "-b", backend]
-        if lang:
-            cmd += ["-l", lang]
-        log(f"[mineru2md] running: {' '.join(cmd)}")
+        if IN_PROCESS:
+            _parse_in_process(input_path, outdir, method, backend, lang, log)
+        else:
+            cmd = ["mineru", "-p", input_path, "-o", outdir, "-m", method, "-b", backend]
+            if lang:
+                cmd += ["-l", lang]
+            log(f"[mineru2md] running: {' '.join(cmd)}")
 
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if proc.returncode != 0:
-            err(f"[mineru2md] ERROR: mineru ({backend}) exited {proc.returncode}")
-            err(proc.stderr[-2000:] if proc.stderr else "(no stderr)")
-            sys.exit(4)
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0:
+                err(f"[mineru2md] ERROR: mineru ({backend}) exited {proc.returncode}")
+                err(proc.stderr[-2000:] if proc.stderr else "(no stderr)")
+                sys.exit(4)
 
         stem = os.path.splitext(os.path.basename(input_path))[0]
         candidates = glob.glob(os.path.join(outdir, "**", "*.md"), recursive=True)
@@ -439,7 +467,7 @@ def reconcile_spelling(primary_md, reference_md, log):
     return substituted_md, changes
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(prog="mineru2md", description="MinerU PDF->Markdown wrapper.")
     ap.add_argument("input", help="input PDF path")
     ap.add_argument("-o", "--output", help="output markdown file (default: stdout)")
@@ -466,8 +494,88 @@ def main():
                          "MinerU always writes this file, this flag only controls whether the "
                          "wrapper preserves it before the temp directory is discarded).")
     ap.add_argument("--quiet", action="store_true", help="suppress stderr logs")
-    args = ap.parse_args()
+    return ap
 
+
+def main():
+    argv = sys.argv[1:]
+    if argv[:1] == ["--serve"]:
+        if len(argv) != 2:
+            err("usage: mineru2md --serve QUEUE_DIR")
+            sys.exit(2)
+        serve(argv[1])
+        return
+    convert(build_parser().parse_args(argv))
+
+
+SERVE_IDLE_TIMEOUT = 6 * 3600    # a job that never says stop still ends
+
+
+def serve(queue):
+    """One MinerU for a whole job: models load on the first request and stay
+    loaded until the job ends (engines/mineru/mineru.sh submits here when
+    PDF2MD_MINERU_SERVER names this queue; tools/mineru-session starts and
+    stops it). Each request is QUEUE/requests/<id>.json holding this
+    wrapper's own argv, paths inside QUEUE; the reply is QUEUE/<id>/status.json
+    ({"rc": 0|n}). Requests run one at a time. A failed request fails alone;
+    the server carries on. QUEUE/stop ends it once no request is waiting;
+    QUEUE/alive is touched every few seconds so clients can tell it's up."""
+    import json
+    import threading
+    global IN_PROCESS
+    IN_PROCESS = True
+    req_dir = os.path.join(queue, "requests")
+    os.makedirs(req_dir, exist_ok=True)
+    alive = os.path.join(queue, "alive")
+    done = threading.Event()
+
+    def heartbeat():
+        while not done.is_set():
+            with open(alive, "w") as f:
+                f.write(str(time.time()))
+            done.wait(5)
+    threading.Thread(target=heartbeat, daemon=True).start()
+    err(f"[mineru2md] serving {queue} (models load on the first request)")
+    last = time.time()
+    try:
+        while True:
+            reqs = sorted(f for f in os.listdir(req_dir) if f.endswith(".json"))
+            if not reqs:
+                if os.path.exists(os.path.join(queue, "stop")) or \
+                        time.time() - last > SERVE_IDLE_TIMEOUT:
+                    break
+                time.sleep(0.5)
+                continue
+            path = os.path.join(req_dir, reqs[0])
+            rid = reqs[0][:-5]
+            try:
+                with open(path, encoding="utf-8") as f:
+                    argv = json.load(f)
+                os.unlink(path)
+            except (OSError, ValueError) as e:
+                err(f"[mineru2md] bad request {reqs[0]}: {e}")
+                continue
+            t0, rc = time.time(), 0
+            try:
+                convert(build_parser().parse_args(argv))
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else 1
+            except Exception as e:
+                err(f"[mineru2md] request {rid} failed: {e!r}")
+                rc = 1
+            os.makedirs(os.path.join(queue, rid), exist_ok=True)
+            tmp = os.path.join(queue, rid, "status.json.tmp")
+            with open(tmp, "w") as f:
+                json.dump({"rc": rc, "secs": round(time.time() - t0, 1)}, f)
+            os.replace(tmp, os.path.join(queue, rid, "status.json"))
+            last = time.time()
+    finally:
+        done.set()
+        err("[mineru2md] server stopping")
+
+
+def convert(args):
+    """One document through MinerU, as the command line describes it."""
     def log(*a):
         if not args.quiet:
             err(*a)

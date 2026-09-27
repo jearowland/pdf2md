@@ -91,6 +91,9 @@ def planned_engines(pdf: Path, dev_bind: bool) -> dict[int, str]:
     return engines
 
 
+REMOTE_MINERU_SERVER = ""   # set by main: one MinerU server for the whole remote run
+
+
 def convert(pdf: Path, out_md: Path, remote: str | None, dev_bind: bool,
             extra: list[str]) -> None:
     """Run the router locally, or on `remote` with the output copied back."""
@@ -105,7 +108,9 @@ def convert(pdf: Path, out_md: Path, remote: str | None, dev_bind: bool,
     subprocess.run(["ssh", remote, f"rm -rf {q(rdir)} && mkdir -p {q(rdir)}"], check=True)
     subprocess.run(["scp", "-q", str(pdf), f"{remote}:{rdir}/"], check=True)
     subprocess.run(["ssh", remote,
-                    f"cd ~/pdf2md && python3 pdf2md_route.py "
+                    f"cd ~/pdf2md && "
+                    + (f"PDF2MD_MINERU_SERVER={q(REMOTE_MINERU_SERVER)} " if REMOTE_MINERU_SERVER else "")
+                    + f"python3 pdf2md_route.py "
                     f"tmp/uat-run/{q(pdf.stem)}/{q(pdf.name)} "
                     f"-o tmp/uat-run/{q(pdf.stem)}/{q(out_md.name)} "
                     + " ".join(q(a) for a in extra)], check=True)
@@ -164,6 +169,9 @@ def main() -> None:
                     help="convert on this worker (its ~/pdf2md at this commit)")
     ap.add_argument("--ids", help="comma-separated case ids to run (default: all)")
     ap.add_argument("--out", help="run folder (default tmp/uat/<commit>[-dirty])")
+    ap.add_argument("--no-mineru-server", action="store_true",
+                    help="remote runs: one-shot MinerU containers per run, as before "
+                         "(default: one MinerU server for the whole run)")
     ap.add_argument("--dev-bind", action="store_true",
                     help="local runs only: overlay this checkout's text-engine "
                          "scripts on the baked image (see pdf2md_route.py)")
@@ -191,20 +199,41 @@ def main() -> None:
     tier = "classify-only" if args.classify_only else f"full ({args.remote or 'local'})"
     print(f"[uat] {len(cases)} case(s), commit {head}{'-dirty' if dirty else ''}, "
           f"tier {tier} -> {run_dir}", file=sys.stderr)
+    global REMOTE_MINERU_SERVER
+    if args.remote and not args.classify_only and not args.no_mineru_server:
+        # one MinerU for the whole run: models load once, not once per case
+        REMOTE_MINERU_SERVER = subprocess.run(
+            ["ssh", args.remote, "cd ~/pdf2md && tools/mineru-session start"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        print(f"[uat] MinerU server on {args.remote}: {REMOTE_MINERU_SERVER}", file=sys.stderr)
     results = []
-    for c in cases:
-        r = check_case(c, run_dir, args)
-        results.append(r)
-        print(f"{r['status']}  {r['id']}", flush=True)
-        for f in r.get("failures", []):
-            print(f"      {f}", flush=True)
-        for w in r.get("warnings", []):
-            print(f"      warning: {w.get('kind')} page {w.get('page', '-')}", flush=True)
+    try:
+        for c in cases:
+            results.append(run_one(c, run_dir, args))
+    finally:
+        if REMOTE_MINERU_SERVER:
+            subprocess.run(["ssh", args.remote,
+                            f"cd ~/pdf2md && tools/mineru-session stop {shlex.quote(REMOTE_MINERU_SERVER)}"],
+                           check=False)
     (run_dir / "results.json").write_text(json.dumps(
         {"commit": head, "dirty": dirty, "tier": tier, "results": results}, indent=1))
     n_fail = sum(r["status"] == "FAIL" for r in results)
     print(f"[uat] {len(results) - n_fail} passed, {n_fail} failed", file=sys.stderr)
     sys.exit(1 if n_fail else 0)
+
+
+def run_one(c, run_dir, args):
+    """One case, reported as it finishes; its result with wall time."""
+    import time
+    t0 = time.time()
+    r = check_case(c, run_dir, args)
+    r["secs"] = round(time.time() - t0, 1)
+    print(f"{r['status']}  {r['id']}  ({r['secs']}s)", flush=True)
+    for f in r.get("failures", []):
+        print(f"      {f}", flush=True)
+    for w in r.get("warnings", []):
+        print(f"      warning: {w.get('kind')} page {w.get('page', '-')}", flush=True)
+    return r
 
 
 if __name__ == "__main__":

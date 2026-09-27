@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# One MinerU for a whole job: its models load once and stay loaded until the job ends.
+#
+#   tools/mineru-session start           start a server; prints its queue dir (export it as PDF2MD_MINERU_SERVER)
+#   tools/mineru-session stop QUEUE      let it finish what's queued, stop it, delete the queue dir
+#   tools/mineru-session run -- CMD...   start, run CMD with PDF2MD_MINERU_SERVER set, stop (whatever CMD's exit)
+#
+# Each fresh MinerU container spends ~30 s loading models before seconds of GPU work, so a job
+# with many OCR runs (several scanned stretches in one document, a batch of files, a UAT run)
+# was mostly model loading. While PDF2MD_MINERU_SERVER is set, engines/mineru/mineru.sh hands
+# its work to this server instead of starting a container. The server container is hardened like
+# the one-shot one (mineru.sh) and mounts only its own queue dir and the models; it takes the
+# host-wide MinerU GPU lock for its whole life, so it never shares the card with another MinerU.
+set -euo pipefail
+REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+LOCK_FILE="${PDF2MD_MINERU_LOCK:-/tmp/pdf2md-mineru.lock}"
+MODELS="${MINERU_MODELS:-$HOME/.cache/mineru-models}"
+
+start() {
+  mkdir -p "$REPO/tmp" "$MODELS"
+  local q; q="$(mktemp -d "$REPO/tmp/mineru-q.XXXXXX")"
+  mkdir -p "$q/requests"
+  (
+    flock "$LOCK_FILE" docker run --rm --name "pdf2md-mineru-$(basename "$q" | tr -c 'a-zA-Z0-9\n' '-')" \
+      --gpus all \
+      --user "$(id -u):$(id -g)" -e HOME=/tmp \
+      -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+      --network none --shm-size 32g \
+      --cap-drop ALL --security-opt no-new-privileges \
+      --pids-limit 4096 --memory 20g \
+      -v "$MODELS":/models \
+      -v "$q":/q \
+      pdf2md-mineru --serve /q >"$q/server.log" 2>&1
+    echo $? >"$q/exited"
+  ) </dev/null >/dev/null 2>&1 &
+  echo "$q"
+}
+
+stop() {
+  local q="$1"
+  [ -d "$q/requests" ] || { echo "mineru-session: not a queue dir: $q" >&2; return 1; }
+  touch "$q/stop"
+  # the server stops once its queue is empty; a request in flight finishes first
+  for _ in $(seq 1 600); do [ -f "$q/exited" ] && break; sleep 1; done
+  if [ ! -f "$q/exited" ]; then
+    docker kill "pdf2md-mineru-$(basename "$q" | tr -c 'a-zA-Z0-9\n' '-')" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$q"   # holds copies of the job's pages
+}
+
+case "${1:-}" in
+  start) start ;;
+  stop) stop "${2:?usage: mineru-session stop QUEUE}" ;;
+  run)
+    shift; [ "${1:-}" = "--" ] && shift
+    q="$(start)"
+    rc=0
+    PDF2MD_MINERU_SERVER="$q" "$@" || rc=$?
+    stop "$q"
+    exit "$rc"
+    ;;
+  *) sed -n '2,7p' "$0" >&2; exit 2 ;;
+esac

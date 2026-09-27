@@ -228,6 +228,26 @@ plain words, and unloads the model afterwards. An icon that can't be
 labelled shows as `[icon]`. Off by default: without the flag, output is
 unchanged. The labels are listed in the manifest under `icons`.
 
+## MinerU start-up: one server per job
+
+A fresh MinerU container spends ~30 s loading models before seconds of GPU
+work, so a document with several scanned stretches, a batch of files or a UAT
+run was mostly model loading. `tools/mineru-session` runs one MinerU for a
+whole job instead (`mineru2md.py --serve`, calling MinerU in-process so its
+models stay loaded), hardened like the one-shot container and mounting only its
+own queue folder. `engines/mineru/mineru.sh` hands work to it whenever
+`PDF2MD_MINERU_SERVER` is set:
+
+```bash
+tools/mineru-session run -- ./pdf2md-auto.sh a.pdf -o a.md     # one job, one model load
+```
+
+The router starts one per document by itself when a document has two or more
+MinerU runs; `tools/uat.py --remote` starts one for the whole run. With starts
+cheap, a page with a healthy text layer is no longer folded into a
+whole-document MinerU run: on a report of 35 scanned and 5 digital pages,
+that run lost the digital pages outright.
+
 ## Regression testing
 
 `tools/uat.py` re-checks every verified fix against a **private** case list

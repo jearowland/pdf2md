@@ -73,6 +73,7 @@ REPO = Path(__file__).resolve().parent
 MINERU_SH = REPO / "engines" / "mineru" / "mineru.sh"
 PAGE_MARKER_RE = re.compile(r"<!-- page (\d+) -->")
 WHOLE_DOC_OCR_RATIO = 0.8   # see plan_runs
+HEALTHY_TEXT_CHARS = 200    # a text page this full is never OCR'd whole-document
 MAX_RUNS = 24
 
 
@@ -229,7 +230,14 @@ def plan_runs(per_page: list[dict], whole_doc_ocr_ratio: float,
     """
     n = len(per_page)
     ocr_share = sum(1 for p in per_page if p["class"] == "ocr") / max(n, 1)
-    if ocr_share >= whole_doc_ocr_ratio:
+    # Never fold a page with a healthy text layer into a whole-document OCR
+    # run: on a real report of 35 scanned pages and 5 digital ones, MinerU's
+    # whole-document run lost the digital pages outright (three empty, one
+    # at 5% of its words). The shortcut only saved container start-ups,
+    # which a document's MinerU server (tools/mineru-session) now makes cheap.
+    healthy_text = any(p["class"] == "text" and p["text_chars"] >= HEALTHY_TEXT_CHARS
+                       for p in per_page)
+    if ocr_share >= whole_doc_ocr_ratio and not healthy_text:
         return [(1, n, "mineru")]
     runs: list[tuple[int, int, str]] = []
     for p in per_page:
@@ -262,6 +270,37 @@ def table_rows_per_page(md: str, total_pages: int) -> dict[int, int]:
         if line.lstrip().startswith("|"):
             counts[page] = counts.get(page, 0) + 1
     return counts
+
+
+def convert_runs(runs, pdf, pc, workdir, stem, labels, args):
+    """Slice each run out and convert it through its engine; [(run, md)]."""
+    parts: list[tuple[tuple[int, int, str], Path]] = []
+    for a, b, eng in runs:
+        if (a, b) == (1, pc):
+            piece_pdf = pdf                      # fast path: no slice needed
+        else:
+            piece_pdf = workdir / f"{stem}.p{a:04d}-{b:04d}.pdf"
+            docker_text(workdir, [f"/work/{pdf.name}", "--slice", f"{a}-{b}",
+                                  "-o", f"/work/{piece_pdf.name}"], args.dev_bind)
+        piece_md = workdir / f"{stem}.p{a:04d}-{b:04d}.md"
+        if eng == "text":
+            argv = [f"/work/{piece_pdf.name}", "-o", f"/work/{piece_md.name}"]
+            run_labels = [{**l, "page": l["page"] - a + 1} for l in labels
+                          if a <= l["page"] <= b]
+            if run_labels:
+                lab_path = workdir / f"{stem}.p{a:04d}-{b:04d}.icon-labels.json"
+                lab_path.write_text(json.dumps(run_labels), encoding="utf-8")
+                argv += ["--icon-labels", f"/work/{lab_path.name}"]
+            docker_text(workdir, argv, args.dev_bind)
+        else:
+            # via mineru.sh so the host-wide GPU flock applies. -o is
+            # forwarded into the container verbatim and must be relative to
+            # the input's directory (mounted as /work) -- an absolute host
+            # path is invisible in there.
+            subprocess.run([str(MINERU_SH), str(piece_pdf),
+                            "-o", piece_md.name], check=True)
+        parts.append(((a, b, eng), piece_md))
+    return parts
 
 
 def main():
@@ -349,34 +388,24 @@ def main():
                 f.unlink()
             icon_dir.rmdir()
 
-    # 4. convert each run
-    parts: list[tuple[tuple[int, int, str], Path]] = []
-    for a, b, eng in runs:
-        if (a, b) == (1, pc):
-            piece_pdf = pdf                      # fast path: no slice needed
-        else:
-            piece_pdf = workdir / f"{stem}.p{a:04d}-{b:04d}.pdf"
-            docker_text(workdir, [f"/work/{pdf.name}", "--slice", f"{a}-{b}",
-                                  "-o", f"/work/{piece_pdf.name}"], args.dev_bind)
-        piece_md = workdir / f"{stem}.p{a:04d}-{b:04d}.md"
-        if eng == "text":
-            argv = [f"/work/{piece_pdf.name}", "-o", f"/work/{piece_md.name}"]
-            run_labels = [{**l, "page": l["page"] - a + 1} for l in labels
-                          if a <= l["page"] <= b]
-            if run_labels:
-                lab_path = workdir / f"{stem}.p{a:04d}-{b:04d}.icon-labels.json"
-                lab_path.write_text(json.dumps(run_labels), encoding="utf-8")
-                argv += ["--icon-labels", f"/work/{lab_path.name}"]
-            docker_text(workdir, argv, args.dev_bind)
-        else:
-            # via mineru.sh so the host-wide GPU flock applies. -o is
-            # forwarded into the container verbatim and must be relative to
-            # the input's directory (mounted as /work) -- an absolute host
-            # path is invisible in there.
-            subprocess.run([str(MINERU_SH), str(piece_pdf),
-                            "-o", piece_md.name], check=True)
-        parts.append(((a, b, eng), piece_md))
+    # 4. convert each run. Two or more MinerU runs share one MinerU server for
+    # this document (models load once), unless the caller already runs one
+    # for its whole job (PDF2MD_MINERU_SERVER).
+    import os
+    own_session = None
+    if sum(1 for _, _, e in runs if e == "mineru") >= 2 and not os.environ.get("PDF2MD_MINERU_SERVER"):
+        own_session = subprocess.run([str(REPO / "tools" / "mineru-session"), "start"],
+                                     check=True, capture_output=True, text=True).stdout.strip()
+        os.environ["PDF2MD_MINERU_SERVER"] = own_session
+        err(f"[route] MinerU server for this document: {own_session}")
+    try:
+        parts = convert_runs(runs, pdf, pc, workdir, stem, labels, args)
+    finally:
+        if own_session:
+            subprocess.run([str(REPO / "tools" / "mineru-session"), "stop", own_session], check=False)
+            del os.environ["PDF2MD_MINERU_SERVER"]
 
+    # 5. merge
     # 5. merge with global page numbering. Markers sit BETWEEN pages inside a
     # chunk; at each chunk boundary we add the boundary page's marker
     # explicitly (except before global page 1) so global numbering never
