@@ -247,29 +247,15 @@ def insert_page_markers(md, content_list_json, log):
     return "".join(out), n_inserted
 
 
-# --serve sets this: MinerU is called in this process (mineru.cli.common's
-# do_parse, the same function the mineru CLI ends up in), so its models load
-# once and stay loaded for every request of the job. The one-shot path keeps
-# the CLI.
-IN_PROCESS = False
-
-
-def _parse_in_process(input_path, outdir, method, backend, lang, log):
-    """MinerU's own do_parse into outdir: the same <stem>/<method>/ tree and
-    files the mineru CLI writes, so run_mineru reads them the same way."""
-    from mineru.cli.common import do_parse
-    stem = os.path.splitext(os.path.basename(input_path))[0]
-    with open(input_path, "rb") as f:
-        pdf_bytes = f.read()
-    log(f"[mineru2md] in-process do_parse: {os.path.basename(input_path)} "
-        f"backend={backend} method={method}")
-    try:
-        do_parse(outdir, [stem], [pdf_bytes], [lang or "ch"], backend=backend,
-                 parse_method=method, f_draw_layout_bbox=False, f_draw_span_bbox=False,
-                 f_dump_model_output=False, f_dump_orig_pdf=False)
-    except Exception as e:
-        err(f"[mineru2md] ERROR: mineru ({backend}) failed in-process: {e!r}")
-        sys.exit(4)
+# --serve sets this: every mineru call goes to one mineru-api the server keeps
+# running for the whole job (inside its own container, on loopback), instead
+# of each call starting a temporary one -- which is what cost ~30 s of model
+# loading per call. Same CLI, same API code, so the same output as a one-shot
+# run. (Calling MinerU's do_parse directly was tried first: it skipped some of
+# the CLI path's preparation and turned a pasted balance sheet into
+# "[Illegible]".)
+API_URL = None
+API_PORT = 8000
 
 
 def run_mineru(input_path, method, backend, lang, log, want_content_list=False,
@@ -310,19 +296,18 @@ def run_mineru(input_path, method, backend, lang, log, want_content_list=False,
     anything in this repo."""
     t0 = time.time()
     with tempfile.TemporaryDirectory() as outdir:
-        if IN_PROCESS:
-            _parse_in_process(input_path, outdir, method, backend, lang, log)
-        else:
-            cmd = ["mineru", "-p", input_path, "-o", outdir, "-m", method, "-b", backend]
-            if lang:
-                cmd += ["-l", lang]
-            log(f"[mineru2md] running: {' '.join(cmd)}")
+        cmd = ["mineru", "-p", input_path, "-o", outdir, "-m", method, "-b", backend]
+        if lang:
+            cmd += ["-l", lang]
+        if API_URL:
+            cmd += ["--api-url", API_URL]
+        log(f"[mineru2md] running: {' '.join(cmd)}")
 
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if proc.returncode != 0:
-                err(f"[mineru2md] ERROR: mineru ({backend}) exited {proc.returncode}")
-                err(proc.stderr[-2000:] if proc.stderr else "(no stderr)")
-                sys.exit(4)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            err(f"[mineru2md] ERROR: mineru ({backend}) exited {proc.returncode}")
+            err(proc.stderr[-2000:] if proc.stderr else "(no stderr)")
+            sys.exit(4)
 
         stem = os.path.splitext(os.path.basename(input_path))[0]
         candidates = glob.glob(os.path.join(outdir, "**", "*.md"), recursive=True)
@@ -516,8 +501,8 @@ SERVE_IDLE_TIMEOUT = 600
 
 
 def serve(queue):
-    """One MinerU for a whole job: models load on the first request and stay
-    loaded until the job ends (engines/mineru/mineru.sh submits here when
+    """One MinerU for a whole job: a mineru-api loads the models once, at
+    start, and stays up until the job ends (engines/mineru/mineru.sh submits here when
     PDF2MD_MINERU_SERVER names this queue; tools/mineru-session starts and
     stops it). Each request is QUEUE/requests/<id>.json holding this
     wrapper's own argv, paths inside QUEUE; the reply is QUEUE/<id>/status.json
@@ -526,8 +511,22 @@ def serve(queue):
     QUEUE/alive is touched every few seconds so clients can tell it's up."""
     import json
     import threading
-    global IN_PROCESS
-    IN_PROCESS = True
+    import urllib.request
+    global API_URL
+    api = subprocess.Popen(["mineru-api", "--host", "127.0.0.1", "--port", str(API_PORT),
+                            "--enable-vlm-preload", "true"],
+                           stdout=open(os.path.join(queue, "api.log"), "w"),
+                           stderr=subprocess.STDOUT)
+    API_URL = f"http://127.0.0.1:{API_PORT}"
+    for _ in range(600):   # models load here, once
+        if api.poll() is not None:
+            err(f"[mineru2md] mineru-api exited ({api.returncode}); see api.log")
+            sys.exit(4)
+        try:
+            urllib.request.urlopen(API_URL + "/docs", timeout=2)
+            break
+        except Exception:
+            time.sleep(1)
     req_dir = os.path.join(queue, "requests")
     os.makedirs(req_dir, exist_ok=True)
     alive = os.path.join(queue, "alive")
@@ -575,6 +574,11 @@ def serve(queue):
             last = time.time()
     finally:
         done.set()
+        api.terminate()
+        try:
+            api.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            api.kill()
         err("[mineru2md] server stopping")
 
 

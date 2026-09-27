@@ -109,7 +109,7 @@ def convert(pdf: Path, out_md: Path, remote: str | None, dev_bind: bool,
     subprocess.run(["scp", "-q", str(pdf), f"{remote}:{rdir}/"], check=True)
     subprocess.run(["ssh", remote,
                     f"cd ~/pdf2md && "
-                    + (f"PDF2MD_MINERU_SERVER={q(REMOTE_MINERU_SERVER)} " if REMOTE_MINERU_SERVER else "")
+                    + (f"PDF2MD_MINERU_SERVER={q(REMOTE_MINERU_SERVER or 'off')} ")
                     + f"python3 pdf2md_route.py "
                     f"tmp/uat-run/{q(pdf.stem)}/{q(pdf.name)} "
                     f"-o tmp/uat-run/{q(pdf.stem)}/{q(out_md.name)} "
@@ -170,8 +170,9 @@ def main() -> None:
     ap.add_argument("--ids", help="comma-separated case ids to run (default: all)")
     ap.add_argument("--out", help="run folder (default tmp/uat/<commit>[-dirty])")
     ap.add_argument("--no-mineru-server", action="store_true",
-                    help="remote runs: one-shot MinerU containers per run, as before "
-                         "(default: one MinerU server for the whole run)")
+                    help="remote runs: one-shot MinerU containers, as before this server "
+                         "existed -- no run-wide server and none per document "
+                         "(PDF2MD_MINERU_SERVER=off); for baselines")
     ap.add_argument("--dev-bind", action="store_true",
                     help="local runs only: overlay this checkout's text-engine "
                          "scripts on the baked image (see pdf2md_route.py)")

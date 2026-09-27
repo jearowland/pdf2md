@@ -398,6 +398,7 @@ def main():
     # idle timeout
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     own_session = None
+    # PDF2MD_MINERU_SERVER=off: one-shot containers, as before (baselines)
     if sum(1 for _, _, e in runs if e == "mineru") >= 2 and not os.environ.get("PDF2MD_MINERU_SERVER"):
         own_session = subprocess.run([str(REPO / "tools" / "mineru-session"), "start"],
                                      check=True, capture_output=True, text=True).stdout.strip()

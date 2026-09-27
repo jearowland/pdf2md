@@ -33,6 +33,7 @@ mkdir -p "$MODELS"
 # A job's MinerU server (tools/mineru-session) is running: hand this document to
 # it instead of starting a container, so the models don't load again. Needs -o
 # (the server writes files); without it, fall through to a one-shot container.
+# PDF2MD_MINERU_SERVER=off (no such queue dir) also means one-shot.
 if [ -n "${PDF2MD_MINERU_SERVER:-}" ] && [ -d "$PDF2MD_MINERU_SERVER/requests" ]; then
   Q="$PDF2MD_MINERU_SERVER"; OUT=""; REST=(); prev=""
   for a in "$@"; do
