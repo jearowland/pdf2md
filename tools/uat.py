@@ -11,7 +11,8 @@ per line:
    "defect": "one line: what went wrong before the fix",
    "expect": {"engine_per_page": {"12": "mineru"},     # optional
               "must_contain": ["..."],                  # optional
-              "must_not_contain": ["..."]}}             # optional
+              "must_not_contain": ["..."]},             # optional
+   "router_args": ["--alt-text-ollama", "http://localhost:11434"]}  # optional
 
 Quote marks are compared loosely (curly and straight are the same), since
 engines differ there legitimately: the text engine keeps the PDF's own
@@ -90,10 +91,11 @@ def planned_engines(pdf: Path, dev_bind: bool) -> dict[int, str]:
     return engines
 
 
-def convert(pdf: Path, out_md: Path, remote: str | None, dev_bind: bool) -> None:
+def convert(pdf: Path, out_md: Path, remote: str | None, dev_bind: bool,
+            extra: list[str]) -> None:
     """Run the router locally, or on `remote` with the output copied back."""
     if not remote:
-        cmd = [sys.executable, str(REPO / "pdf2md_route.py"), str(pdf), "-o", str(out_md)]
+        cmd = [sys.executable, str(REPO / "pdf2md_route.py"), str(pdf), "-o", str(out_md), *extra]
         if dev_bind:
             cmd.append("--dev-bind")
         subprocess.run(cmd, check=True)
@@ -105,7 +107,8 @@ def convert(pdf: Path, out_md: Path, remote: str | None, dev_bind: bool) -> None
     subprocess.run(["ssh", remote,
                     f"cd ~/pdf2md && python3 pdf2md_route.py "
                     f"tmp/uat-run/{q(pdf.stem)}/{q(pdf.name)} "
-                    f"-o tmp/uat-run/{q(pdf.stem)}/{q(out_md.name)}"], check=True)
+                    f"-o tmp/uat-run/{q(pdf.stem)}/{q(out_md.name)} "
+                    + " ".join(q(a) for a in extra)], check=True)
     man = out_md.with_suffix(".manifest.json").name
     subprocess.run(["scp", "-q", f"{remote}:{rdir}/{out_md.name}",
                     f"{remote}:{rdir}/{man}", str(out_md.parent)], check=True)
@@ -129,7 +132,7 @@ def check_case(case: dict, run_dir: Path, args) -> dict:
     else:
         out_md = work / f"{cid}.md"
         try:
-            convert(pdf, out_md, args.remote, args.dev_bind)
+            convert(pdf, out_md, args.remote, args.dev_bind, case.get("router_args", []))
         except subprocess.CalledProcessError as e:
             result.update(status="FAIL", failures=[f"conversion failed: {e}"])
             return result
