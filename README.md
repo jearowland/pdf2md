@@ -54,7 +54,7 @@ account.
 
 ## Known defects, and how each is handled
 
-Nine distinct silent-failure classes were found and fixed during validation.
+Ten distinct silent-failure classes were found and fixed during validation.
 Each needed a different kind of fix — worth understanding before touching
 this code, since a fix for one class does not generalise to another.
 
@@ -203,6 +203,18 @@ Each routed run's engine appended its own heading index, numbered from that
 run's first page, so a mixed document had several indexes mid-document with
 wrong page numbers. The router now drops them and indexes the merged
 document once.
+
+### 10. Statement rows merged, thousands separators dropped (tables)
+On tightly spaced statement rows the text engine's table path can cut
+through a number's low-sitting commas: on a real report "(1,207,513)" came
+out "(1207513)" (its commas landing in the next row as ",,"), "66,529" as
+"66529", and pairs of rows were merged into one ("Additions<br>Disposals").
+A bare number found nowhere on the page gets its separators back when
+exactly one word in the page's own text layer has the same digits; a body
+row whose first cell holds 2+ labels and whose other cells hold the same
+number of amounts is split back into rows. Headers, wrapped labels and prose
+are never split. On 60 corpus documents: 3 rows split, all correct; no amount
+changed.
 
 ## Icon alt text (opt-in)
 

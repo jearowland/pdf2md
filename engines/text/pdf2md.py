@@ -61,6 +61,72 @@ def _letters_only(s):
     return re.sub(r"[^A-Za-z]", "", s).upper()
 
 
+BARE_NUMBER_RE = re.compile(r"(?<![\w,.])\(?-?\d{4,}(?:\.\d+)?\)?(?![\w,.])")
+GROUPED_NUMBER_RE = re.compile(r"\(?-?\d{1,3}(?:,\d{3})+(?:\.\d+)?\)?")
+
+
+def repair_table_numbers(text, page_words):
+    """Put back thousands separators the table-cell path dropped. On tightly
+    spaced statement rows the table's row boundary can cut through a
+    number's low-sitting commas: "(1,207,513)" came out "(1207513)" (its
+    commas landing in the next row as ",,"), and "66,529" as "66529" -- on a
+    real report, where MinerU had kept them. A bare number is rewritten only
+    when it appears nowhere on the page as written, and exactly ONE word in
+    the page's own text layer has the same digits, sign and decimals with
+    separators; digits never change."""
+    grouped = {}
+    for w in page_words:
+        for m in GROUPED_NUMBER_RE.finditer(w):
+            grouped.setdefault(m.group(0).replace(",", ""), set()).add(m.group(0))
+    bare_on_page = {w for w in page_words if BARE_NUMBER_RE.fullmatch(w)}
+    if not grouped:
+        return text
+
+    def fix(m):
+        tok = m.group(0)
+        if tok in bare_on_page:
+            return tok
+        found = grouped.get(tok)
+        return next(iter(found)) if found and len(found) == 1 else tok
+    return BARE_NUMBER_RE.sub(fix, text)
+
+
+JUNK_CELL_LINE_RE = re.compile(r"^[,.\s]*$")
+AMOUNT_LINE_RE = re.compile(r"^\s*[($]?\s*[-\u2010\u2011\u2012\u2013\u2014]?\s*"
+                            r"(?:\d{1,3}(?:,\d{3})*|\d+)?(?:\.\d+)?\s*\)?\s*%?\s*$")
+
+
+def split_merged_rows(text):
+    """Split a merged statement row back into its rows. The table-cell path
+    merged pairs of statement rows on a real report ("Additions<br>Disposals
+    | 35,156<br>(1,207,513) | 1,320<br>-"). A row is split only when all of
+    these hold: it is a body row (never a table's header row); its first
+    cell holds 2+ label lines; every other cell holds the SAME number of
+    lines, each an amount or a nil mark; lines that are empty or only
+    commas/stops (separators pushed out of a number, see
+    repair_table_numbers) don't count. Anything else -- a wrapped label
+    beside one value, a header with year and unit, prose -- is left as is."""
+    lines = text.split("\n")
+    out = []
+    for i, line in enumerate(lines):
+        is_header = i + 1 < len(lines) and lines[i + 1].startswith("|---")
+        if is_header or not (line.startswith("|") and line.endswith("|") and "<br>" in line):
+            out.append(line)
+            continue
+        cells = line[1:-1].split("|")
+        parts = [[x for x in c.split("<br>") if not JUNK_CELL_LINE_RE.match(x)] for c in cells]
+        k = len(parts[0])
+        ok = (k >= 2 and len(cells) >= 2 and all(len(p) == k for p in parts)
+              and not any(AMOUNT_LINE_RE.match(x) for x in parts[0])
+              and all(AMOUNT_LINE_RE.match(x) for p in parts[1:] for x in p))
+        if ok:
+            for j in range(k):
+                out.append("|" + "|".join(p[j].strip() for p in parts) + "|")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 UNDECODABLE_RUN_RE = re.compile(r"(?:<mark>)?\ufffd{4,}(?:</mark>)?")
 
 
@@ -1186,8 +1252,9 @@ def to_markdown_text(pdf_path, hide_background=True, icon_labels=None):
             page_boxes.append({**box, "text": block_text,
                                 "page_number": page_number,
                                 "doc_pos": (offset + box["pos"][0], offset + box["pos"][1]) if box.get("pos") else None})
-        repaired_text = mark_undecodable(
-            repair_ligature_letters(repair_merged_spacing(text, page_words), page_words))
+        repaired_text = split_merged_rows(repair_table_numbers(mark_undecodable(
+            repair_ligature_letters(repair_merged_spacing(text, page_words), page_words)),
+            page_words))
         parts.append(repaired_text)
         offset += len(repaired_text)
 
