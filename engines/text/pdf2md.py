@@ -61,6 +61,20 @@ def _letters_only(s):
     return re.sub(r"[^A-Za-z]", "", s).upper()
 
 
+UNDECODABLE_RUN_RE = re.compile(r"(?:<mark>)?\ufffd{4,}(?:</mark>)?")
+
+
+def mark_undecodable(text):
+    """Replace a run of 4+ U+FFFD (text whose font has no Unicode map and no
+    embedded program to recover one from) with "[undecodable text]". Such a
+    run carries no information, and a reader or caller can't tell it from
+    corruption: on a real report, a 58-character stamp in a non-embedded,
+    unmapped font came out as a highlighted run of U+FFFD at the top of
+    nearly every page. Shorter runs stay as they are (a lone U+FFFD sits
+    inside a word, where the word's other letters still carry it)."""
+    return UNDECODABLE_RUN_RE.sub("[undecodable text]", text)
+
+
 # Letter sequences fonts commonly draw as one ligature glyph.
 LIGATURE_SEQUENCES = ("ffi", "ffl", "tti", "ff", "fi", "fl", "fj", "ft", "st", "ct", "ch",
                       "ti", "tt", "th")
@@ -192,6 +206,52 @@ def quiet_stdout():
 # full-page image, which stays well under both.
 BACKGROUND_MIN_CHARS_PER_PAGE_AREA = 500
 BACKGROUND_MIN_CHARS = 20
+
+
+@contextlib.contextmanager
+def _restore_none_refs():
+    """Give back the references to None that PyMuPDF 1.28.x's get_bboxlog(),
+    get_texttrace() and get_drawings() drop (see _drawing_facts). Copy what
+    you need out of their results and drop them inside the block."""
+    import ctypes
+    before = sys.getrefcount(None)
+    try:
+        yield
+    finally:
+        for _ in range(max(before - sys.getrefcount(None), 0)):
+            ctypes.pythonapi.Py_IncRef(ctypes.py_object(None))
+
+
+# A digital page reads upright when at least this share of its visible text
+# (and at least UPRIGHT_MIN_CHARS of it) runs left to right as displayed.
+UPRIGHT_MIN_SHARE = 0.9
+UPRIGHT_MIN_CHARS = 100
+
+
+def _text_reads_upright(page):
+    """True when the page's VISIBLE text layer says the page is upright as
+    displayed: most of it runs left to right after the page's /Rotate. The
+    text layer knows its own direction exactly; Tesseract's OSD guesses it
+    from pixels, and on a real report it called four upright notes pages
+    "rotated 180", "verified" the flip, and the text engine then emitted
+    nothing for them. Invisible text (a scan's OCR layer) doesn't count, so
+    scans still go to OSD."""
+    import pymupdf
+    with _restore_none_refs():
+        trace = page.get_texttrace()
+        spans = [(tuple(s["dir"]), sum(1 for c in s["chars"] if not chr(c[0]).isspace()))
+                 for s in trace if s["type"] != 3 and s["opacity"] > 0]
+        del trace
+    total = sum(n for _, n in spans)
+    if total < UPRIGHT_MIN_CHARS:
+        return False
+    m = page.rotation_matrix
+    upright = 0
+    for (dx, dy), n in spans:
+        v = pymupdf.Point(dx, dy) * m - pymupdf.Point(0, 0) * m
+        if v.x > 0.9 and abs(v.y) < 0.2:
+            upright += n
+    return upright >= UPRIGHT_MIN_SHARE * total
 
 
 def _drawing_facts(page):
@@ -771,6 +831,12 @@ def detect_and_fix_rotation(pdf_path, output_path, dpi, min_confidence, log):
     for i in range(len(doc)):
         page = doc[i]
         base_rotation = page.rotation
+        cov, bg = _page_image_coverage(page)
+        if cov - bg <= 0.5 and _text_reads_upright(page):
+            # the page's own text says it's upright; don't ask OSD. Not on a
+            # page mostly covered by a (non-background) image: a pasted scan
+            # printed sideways under an upright header still needs OSD.
+            continue
         result = osd_of(page)
         if result is None:
             continue
@@ -799,8 +865,17 @@ def detect_and_fix_rotation(pdf_path, output_path, dpi, min_confidence, log):
             log(f"[pdf2md] --derotate: WARNING page {i+1} looks rotated "
                 f"(OSD rotate={rotate}°, confidence {conf:.1f}) but no candidate "
                 f"correction verified upright -- left unmodified, review manually")
-    doc.save(output_path)
-    doc.close()
+    if fixed:
+        doc.save(output_path)
+        doc.close()
+    else:
+        # nothing corrected: pass the original bytes on, not a re-save. A
+        # re-save of an unchanged document made the text engine emit nothing
+        # for three pages of a real report (notes pages with ~3,000 chars of
+        # text each) that it converts perfectly from the original file.
+        doc.close()
+        import shutil
+        shutil.copyfile(pdf_path, output_path)
     return fixed, unresolved
 
 
@@ -942,7 +1017,86 @@ def hide_background_images(doc):
     return hidden
 
 
-def to_markdown_text(pdf_path, hide_background=True):
+# Icon-sized images: at most this much of the page, each side between these
+# bounds (points), and no visible text drawn over them (that's a background).
+ICON_MAX_PAGE_SHARE = 0.01
+ICON_MIN_SIDE, ICON_MAX_SIDE = 8, 72
+ICON_MAX_PER_DOC = 100
+
+
+def find_icons(doc):
+    """[(page_number, Rect)] for icon-sized images, in reading order."""
+    import pymupdf
+    icons = []
+    for page in doc:
+        rot = page.rotation
+        if rot:
+            page.set_rotation(0)
+        try:
+            images, spans, _ = _drawing_facts(page)
+            area = page.rect.get_area()
+            for r, sq in images:
+                r = pymupdf.Rect(r & page.rect)
+                if (not r.is_empty and r.get_area() <= ICON_MAX_PAGE_SHARE * area
+                        and ICON_MIN_SIDE <= min(r.width, r.height)
+                        and max(r.width, r.height) <= ICON_MAX_SIDE
+                        and _visible_chars_over(spans, r, sq) == 0):
+                    icons.append((page.number + 1, r))
+        except Exception:
+            continue
+        finally:
+            if rot:
+                page.set_rotation(rot)
+    icons.sort(key=lambda t: (t[0], round(t[1].y0), t[1].x0))
+    return icons[:ICON_MAX_PER_DOC]
+
+
+def extract_icons(pdf_path, out_dir):
+    """Write each icon as a PNG (2x, for the vision model) into out_dir and
+    return [{"page", "rect", "file"}]; see find_icons. The router sends them
+    to a local vision model (this container has no network) and hands the
+    labels back through --icon-labels."""
+    import pymupdf
+    doc = pymupdf.open(pdf_path)
+    rows = []
+    for i, (pno, r) in enumerate(find_icons(doc)):
+        name = f"icon-{i:03d}.png"
+        doc[pno - 1].get_pixmap(clip=r, dpi=144).save(os.path.join(out_dir, name))
+        rows.append({"page": pno, "rect": [round(v, 2) for v in r], "file": name})
+    doc.close()
+    return rows
+
+
+def insert_icon_labels(doc, labels):
+    """Write each icon's label as INVISIBLE text (render mode 3) on the icon,
+    in the text engine's in-memory copy, so the layout model files it with
+    the text around it (a flyer's bus icon lands in its day's table cell).
+    labels: [{"page", "rect", "label"}]; an empty label gives "[icon]".
+    The icon image itself is dropped from that copy: the layout model files
+    an image as a picture box and skips text inside one, so the label would
+    vanish (confirmed on the flyer). The label stands in for the icon."""
+    import pymupdf
+    by_page = {}
+    for row in labels:
+        by_page.setdefault(row["page"], []).append(row)
+    for pno, rows in by_page.items():
+        page = doc[pno - 1]
+        for row in rows:
+            page.add_redact_annot(pymupdf.Rect(row["rect"]), fill=False)
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_REMOVE,
+                              graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                              text=pymupdf.PDF_REDACT_TEXT_NONE)
+        for row in rows:
+            r = pymupdf.Rect(row["rect"])
+            text = f"[icon: {row['label']}]" if row.get("label") else "[icon]"
+            # sized to fit inside the icon: a label wider than its icon spills
+            # into the next table cell and gets split there
+            size = min(8, r.height * 0.8, r.width / max(pymupdf.get_text_length(text, fontsize=1), 1))
+            page.insert_text((r.x0, r.y0 + r.height / 2 + size / 3), text,
+                             fontsize=size, render_mode=3)
+
+
+def to_markdown_text(pdf_path, hide_background=True, icon_labels=None):
     """Digital PDF -> markdown via pymupdf4llm (CPU, no model load).
     Returns (markdown, page_boxes) -- page_boxes is a list of per-page block
     metadata (class, bbox, character position, and the block's own text) for
@@ -989,6 +1143,8 @@ def to_markdown_text(pdf_path, hide_background=True):
     doc = pymupdf.open(pdf_path)
     if hide_background:
         hide_background_images(doc)
+    if icon_labels:
+        insert_icon_labels(doc, icon_labels)
     chunks = pymupdf4llm.to_markdown(doc, use_ocr=False, page_chunks=True)
     plain_doc = pymupdf.open(pdf_path)  # second, independent tokenisation -- see repair_merged_spacing()
 
@@ -1030,8 +1186,8 @@ def to_markdown_text(pdf_path, hide_background=True):
             page_boxes.append({**box, "text": block_text,
                                 "page_number": page_number,
                                 "doc_pos": (offset + box["pos"][0], offset + box["pos"][1]) if box.get("pos") else None})
-        repaired_text = repair_ligature_letters(repair_merged_spacing(text, page_words),
-                                                page_words)
+        repaired_text = mark_undecodable(
+            repair_ligature_letters(repair_merged_spacing(text, page_words), page_words))
         parts.append(repaired_text)
         offset += len(repaired_text)
 
@@ -1093,6 +1249,12 @@ def main():
                          "ligature glyphs given their text back; see prepare_pdf -- print a "
                          "JSON report of what changed to stdout, and exit. Run by "
                          "pdf2md_route.py and pdf2md-auto.sh after --derotate.")
+    ap.add_argument("--extract-icons", metavar="DIR",
+                    help="write icon-sized images as PNGs into DIR, print a JSON list "
+                         "(page, rect, file) to stdout, and exit; see extract_icons")
+    ap.add_argument("--icon-labels", metavar="LABELS.json",
+                    help="conversion: write these icon labels ([{page, rect, label}]) "
+                         "into the text layer at each icon, as [icon: label]")
     ap.add_argument("--rotate-dpi", type=int, default=150,
                     help="render DPI used for --derotate's OSD pass (default 150)")
     ap.add_argument("--rotate-min-confidence", type=float, default=1.0,
@@ -1140,6 +1302,15 @@ def main():
             log(f"[pdf2md] --prepare: font {f['font']}: gave {len(f['glyphs'])} ligature "
                 f"glyph(s) their text back ({', '.join(sorted(set(f['glyphs'].values())))})")
         print(json.dumps(report))
+        return
+
+    if args.extract_icons:
+        import json
+        try:
+            print(json.dumps(extract_icons(args.input, args.extract_icons)))
+        except Exception as e:
+            err(f"[pdf2md] ERROR during --extract-icons: {e}")
+            sys.exit(6)
         return
 
     if args.slice:
@@ -1209,7 +1380,12 @@ def main():
 
     try:
         with quiet_stdout():
-            out, page_boxes = to_markdown_text(args.input)
+            icon_labels = None
+            if args.icon_labels:
+                import json
+                with open(args.icon_labels, encoding="utf-8") as f:
+                    icon_labels = json.load(f)
+            out, page_boxes = to_markdown_text(args.input, icon_labels=icon_labels)
         # Guard: if this 'digital' PDF actually yielded almost nothing, it was
         # really a scan -> tell the user rather than emit near-empty markdown.
         if len(out.strip()) < args.min_page_chars * max(pc, 1) * 0.2:

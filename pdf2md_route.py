@@ -76,6 +76,69 @@ WHOLE_DOC_OCR_RATIO = 0.8   # see plan_runs
 MAX_RUNS = 24
 
 
+TITLE_INDEX_RE = re.compile(r"\n*<!-- pdf2md document index.*?-->\n?", re.S)
+
+
+def text_engine():
+    """engines/text/pdf2md.py as a module, for its document-index builder
+    (it imports only the standard library at module level)."""
+    import importlib.util
+    if "pdf2md_text_engine" not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "pdf2md_text_engine", REPO / "engines" / "text" / "pdf2md.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["pdf2md_text_engine"] = mod
+        spec.loader.exec_module(mod)
+    return sys.modules["pdf2md_text_engine"]
+
+
+ALT_TEXT_PROMPT = ("This is a small icon cut from a document. Reply with a label of one to "
+                   "five words saying what it shows (for example: bus, phone, warning sign, "
+                   "tick). Reply with the label only.")
+
+
+def clean_label(text: str) -> str:
+    """A model reply as a 1-5 word label: first line, letters, digits,
+    spaces and hyphens only, lower case. Anything else is dropped, so a
+    chatty or odd reply can't inject markup into the output."""
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    words = re.sub(r"[^A-Za-z0-9 \-]", " ", line).lower().split()
+    return " ".join(words[:5])
+
+
+def label_icons(icon_dir: Path, icons: list[dict], url: str, model: str) -> list[dict]:
+    """Ask a local vision model (Ollama at `url`) for each icon's label; an
+    icon it can't label keeps an empty label (rendered "[icon]"). The model is
+    unloaded afterwards (keep_alive 0) so the card is free for the next job.
+    Runs on the host: the engine containers have no network."""
+    import base64
+    import urllib.request
+
+    def call(payload: dict, timeout: int = 180) -> dict:
+        req = urllib.request.Request(url.rstrip("/") + "/api/generate",
+                                     data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+
+    out = []
+    for icon in icons:
+        label = ""
+        try:
+            img = base64.b64encode((icon_dir / icon["file"]).read_bytes()).decode()
+            reply = call({"model": model, "prompt": ALT_TEXT_PROMPT, "images": [img],
+                          "stream": False, "options": {"temperature": 0}})
+            label = clean_label(reply.get("response", ""))
+        except Exception as e:
+            err(f"[route] alt text: icon {icon['file']} not labelled: {e}")
+        out.append({"page": icon["page"], "rect": icon["rect"], "label": label})
+    try:
+        call({"model": model, "keep_alive": 0}, timeout=60)
+    except Exception as e:
+        err(f"[route] alt text: could not unload {model}: {e}")
+    return out
+
+
 def err(*a):
     print(*a, file=sys.stderr, flush=True)
 
@@ -206,6 +269,12 @@ def main():
     ap.add_argument("--max-runs", type=int, default=MAX_RUNS)
     ap.add_argument("--keep-parts", action="store_true",
                     help="keep per-run slice PDFs and chunk markdowns")
+    ap.add_argument("--alt-text-ollama", metavar="URL",
+                    help="label icon-sized images on text-engine pages with a local vision "
+                         "model at this Ollama URL (e.g. http://localhost:11434 on a GPU "
+                         "worker); written into the output as [icon: label]. Off by default.")
+    ap.add_argument("--alt-text-model", default="qwen2.5vl:7b",
+                    help="Ollama vision model for --alt-text-ollama (default qwen2.5vl:7b)")
     ap.add_argument("--dev-bind", action="store_true",
                     help="overlay local engines/text/pdf2md.py into the "
                          "container (test classifier changes pre-rebuild)")
@@ -254,6 +323,27 @@ def main():
     err(f"[route] {pc} pages -> {len(runs)} run(s): " +
         ", ".join(f"p{a}-{b}:{e}" for a, b, e in runs))
 
+    # 3b. alt text for icons on text-engine pages (opt-in): crop them in the
+    # container, label them here on the host, hand each text run its labels
+    labels: list[dict] = []
+    if args.alt_text_ollama and any(eng == "text" for _, _, eng in runs):
+        icon_dir = workdir / f"{stem}.icons"
+        icon_dir.mkdir(exist_ok=True)
+        r = docker_text(workdir, [f"/work/{pdf.name}", "--extract-icons",
+                                  f"/work/{icon_dir.name}", "--quiet"],
+                        args.dev_bind, capture=True)
+        text_pages = {p for a, b, eng in runs if eng == "text" for p in range(a, b + 1)}
+        icons = [i for i in json.loads(r.stdout[r.stdout.find("["):] or "[]")
+                 if i["page"] in text_pages]
+        if icons:
+            labels = label_icons(icon_dir, icons, args.alt_text_ollama, args.alt_text_model)
+            err(f"[route] alt text: {sum(1 for l in labels if l['label'])} of "
+                f"{len(labels)} icon(s) labelled")
+        if not args.keep_parts:
+            for f in icon_dir.glob("*"):
+                f.unlink()
+            icon_dir.rmdir()
+
     # 4. convert each run
     parts: list[tuple[tuple[int, int, str], Path]] = []
     for a, b, eng in runs:
@@ -265,8 +355,14 @@ def main():
                                   "-o", f"/work/{piece_pdf.name}"], args.dev_bind)
         piece_md = workdir / f"{stem}.p{a:04d}-{b:04d}.md"
         if eng == "text":
-            docker_text(workdir, [f"/work/{piece_pdf.name}",
-                                  "-o", f"/work/{piece_md.name}"], args.dev_bind)
+            argv = [f"/work/{piece_pdf.name}", "-o", f"/work/{piece_md.name}"]
+            run_labels = [{**l, "page": l["page"] - a + 1} for l in labels
+                          if a <= l["page"] <= b]
+            if run_labels:
+                lab_path = workdir / f"{stem}.p{a:04d}-{b:04d}.icon-labels.json"
+                lab_path.write_text(json.dumps(run_labels), encoding="utf-8")
+                argv += ["--icon-labels", f"/work/{lab_path.name}"]
+            docker_text(workdir, argv, args.dev_bind)
         else:
             # via mineru.sh so the host-wide GPU flock applies. -o is
             # forwarded into the container verbatim and must be relative to
@@ -287,7 +383,11 @@ def main():
         if a > 1:
             merged.append(f"\n\n<!-- page {a} -->\n\n")
         merged.append(chunk)
-    final = "".join(merged)
+    # each run's engine appends its own document index with RUN-local page
+    # numbers; with several runs those landed mid-document, numbered wrong
+    # (reported by a caller). Drop them and index the merged document once.
+    final = TITLE_INDEX_RE.sub("\n\n", "".join(merged)).rstrip("\n") + "\n"
+    final += text_engine().format_title_index(text_engine().build_title_index(final))
     out_md.write_text(final, encoding="utf-8")
 
     # 6. manifest: facts + the two domain-free warnings
@@ -352,6 +452,7 @@ def main():
                       "covered_text_chars": covered.get(p["page"], {}).get("covered_chars", 0)}
                      for p in per_page],
         "ligature_fixes": prepared["ligature_fixes"],
+        "icons": labels,
         "warnings": warnings,
     }
     man_path = out_md.with_suffix(".manifest.json")
@@ -378,6 +479,7 @@ def main():
             Path(str(piece_md)[:-3] + ".content_list.json").unlink(missing_ok=True)
             piece_pdf = workdir / f"{stem}.p{a:04d}-{b:04d}.pdf"
             piece_pdf.unlink(missing_ok=True)
+            (workdir / f"{stem}.p{a:04d}-{b:04d}.icon-labels.json").unlink(missing_ok=True)
 
     err(f"[route] wrote {out_md} + {man_path.name} "
         f"({len(warnings)} warning(s)) in {time.time()-t0:.1f}s")

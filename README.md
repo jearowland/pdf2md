@@ -54,7 +54,7 @@ account.
 
 ## Known defects, and how each is handled
 
-Six distinct silent-failure classes were found and fixed during validation.
+Nine distinct silent-failure classes were found and fixed during validation.
 Each needed a different kind of fix — worth understanding before touching
 this code, since a fix for one class does not generalise to another.
 
@@ -179,6 +179,42 @@ A ligature glyph's later letters get zero-width boxes, and the table-cell
 path clips them ("snowflakes" came out "snowfakes"). A word that appears
 nowhere on the page is repaired only when exactly one of the page's own
 words equals it with a ligature's letters restored.
+
+### 7. Upright pages turned upside down by derotation (geometry)
+Tesseract's orientation check (OSD) called four upright notes pages of a real
+report "rotated 180", and its own recheck "confirmed" the flip; the text
+engine then emitted nothing for them. A digital page's visible text layer
+says which way it reads, exactly, so derotation now skips OSD when at least
+90% of a page's visible text runs left to right as displayed, unless the
+page is mostly covered by a non-background image (a pasted scan printed
+sideways under an upright header still goes to OSD). Scans (no visible
+text) are unchanged. When nothing is corrected, the original bytes are passed
+on instead of a re-save. A side effect: derotation no longer runs OSD on
+digital pages, so it takes about half the time.
+
+### 8. Undecodable text as runs of U+FFFD (text)
+A stamp in a font that is neither embedded nor mapped to Unicode has no
+recoverable text; it came out as a highlighted run of `�` at the top of nearly
+every page of a real report. The text engine writes a run of four or more as
+`[undecodable text]`.
+
+### 9. One document index, with global page numbers (merge)
+Each routed run's engine appended its own heading index, numbered from that
+run's first page, so a mixed document had several indexes mid-document with
+wrong page numbers. The router now drops them and indexes the merged
+document once.
+
+## Icon alt text (opt-in)
+
+`pdf2md_route.py --alt-text-ollama URL` (also through `pdf2md-auto.sh`) labels
+icon-sized images on text-engine pages with a local vision model
+(`--alt-text-model`, default `qwen2.5vl:7b`) and writes each label into the
+output where the icon sits, as `[icon: bus]`. On a grid flyer, each bus icon
+lands in its day's table cell. Icons are cropped in the text container, which has
+no network; the router makes the calls on the host, cleans each reply to 1-5
+plain words, and unloads the model afterwards. An icon that can't be
+labelled shows as `[icon]`. Off by default: without the flag, output is
+unchanged. The labels are listed in the manifest under `icons`.
 
 ## Regression testing
 
