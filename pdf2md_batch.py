@@ -72,8 +72,10 @@ def cpu_workers(reserve_mb: int = 0) -> int:
 
 
 def run_pool(fn, items, workers: int, label: str) -> list:
-    """fn over items on `workers` threads (each drives docker containers);
-    returns the items that failed, after logging why."""
+    """fn over items on `workers` threads (each drives docker containers,
+    each container given its share of the CPU threads); returns the items
+    that failed, after logging why."""
+    route.CONTAINER_THREADS = max(1, (os.cpu_count() or 1) // max(workers, 1))
     failed = []
 
     def one(item):
@@ -180,6 +182,12 @@ def main():
         route.err(f"[batch] CPU: {len(text_now)} text run(s) on {workers} worker(s) during OCR")
         failed |= {d["input"] for d, _ in run_pool(lambda dr: route.convert_text_run(dr[0], dr[1], opts),
                                                    text_now, workers, "text run")}
+        # documents that need nothing from the GPU finish while it works
+        gpu_free = [d for d in docs if d["input"] not in failed
+                    and not any(r[2] == "mineru" for r in d["runs"]) and not d["icons"]]
+        failed |= {d["input"] for d in run_pool(lambda d: route.finalize(d, opts),
+                                                gpu_free, workers, "finalize")}
+        finished = {d["input"] for d in gpu_free}
         g.join()
         failed |= gpu_failed
 
@@ -193,7 +201,8 @@ def main():
                                                [x for x in text_later if x[0]["input"] not in failed],
                                                workers, "text run")}
     failed |= {d["input"] for d in run_pool(lambda d: route.finalize(d, opts),
-                                           [d for d in docs if d["input"] not in failed],
+                                           [d for d in docs if d["input"] not in failed
+                                            and d["input"] not in finished],
                                            workers, "finalize")}
     route.err(f"[batch] {len(pdfs) - len(failed)} of {len(pdfs)} document(s) converted "
               f"in {time.time() - t0:.0f}s" + (f"; failed: {sorted(failed)}" if failed else ""))

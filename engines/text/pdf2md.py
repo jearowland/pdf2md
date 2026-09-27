@@ -1162,6 +1162,42 @@ def insert_icon_labels(doc, labels):
                              fontsize=size, render_mode=3)
 
 
+def _cap_onnx_threads():
+    """When OMP_NUM_THREADS is set (a batch job running many of these
+    containers at once gives each its share of the CPU threads), make the
+    layout model's onnxruntime sessions use that many threads too: they
+    default to one per core and ignore OMP_NUM_THREADS, so a dozen parallel
+    containers ran hundreds of threads on 24 CPUs."""
+    n = os.environ.get("OMP_NUM_THREADS")
+    if not n or not n.isdigit():
+        return
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return
+    if getattr(ort, "_pdf2md_capped", False):
+        return
+    base_opts, base_session = ort.SessionOptions, ort.InferenceSession
+
+    def options():
+        so = base_opts()
+        so.intra_op_num_threads = int(n)
+        so.inter_op_num_threads = 1
+        return so
+
+    class CappedSession(base_session):
+        def __init__(self, path_or_bytes, sess_options=None, *a, **kw):
+            if sess_options is None:
+                sess_options = options()
+            else:
+                sess_options.intra_op_num_threads = int(n)
+                sess_options.inter_op_num_threads = 1
+            super().__init__(path_or_bytes, sess_options, *a, **kw)
+    ort.SessionOptions = options
+    ort.InferenceSession = CappedSession
+    ort._pdf2md_capped = True
+
+
 def to_markdown_text(pdf_path, hide_background=True, icon_labels=None):
     """Digital PDF -> markdown via pymupdf4llm (CPU, no model load).
     Returns (markdown, page_boxes) -- page_boxes is a list of per-page block
@@ -1205,6 +1241,7 @@ def to_markdown_text(pdf_path, hide_background=True, icon_labels=None):
     in the downstream pipeline that actually knows what it's looking for.
     """
     import pymupdf
+    _cap_onnx_threads()
     import pymupdf4llm
     doc = pymupdf.open(pdf_path)
     if hide_background:

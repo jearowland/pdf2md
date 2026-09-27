@@ -520,6 +520,45 @@ def main():
 SERVE_IDLE_TIMEOUT = 600
 
 
+def start_api(log_dir):
+    """mineru-api with the models loaded, on this container's loopback;
+    sets API_URL so every mineru CLI call goes to it. It keeps its working
+    files under ./output, so it runs in a scratch dir inside the container
+    (the image's /work may not be writable; the container, scratch included,
+    is gone when the job ends)."""
+    import urllib.request
+    global API_URL
+    proc = subprocess.Popen(["mineru-api", "--host", "127.0.0.1", "--port", str(API_PORT),
+                             "--enable-vlm-preload", "true"],
+                            cwd=tempfile.mkdtemp(prefix="mineru-api-"),
+                            stdout=open(os.path.join(log_dir, "api.log"), "a"),
+                            stderr=subprocess.STDOUT)
+    API_URL = f"http://127.0.0.1:{API_PORT}"
+    for _ in range(600):   # models load here
+        if proc.poll() is not None:
+            err(f"[mineru2md] mineru-api exited ({proc.returncode}); see api.log")
+            sys.exit(4)
+        try:
+            urllib.request.urlopen(API_URL + "/docs", timeout=2)
+            return proc
+        except Exception:
+            time.sleep(1)
+    proc.kill()
+    err("[mineru2md] mineru-api did not come up in 10 minutes")
+    sys.exit(4)
+
+
+def stop_api(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def serve(queue):
     """One MinerU for a whole job: a mineru-api loads the models on the first
     request and stays up until the job ends (or until QUEUE/unload asks it to
@@ -535,42 +574,6 @@ def serve(queue):
     import urllib.request
     global API_URL
     api = None
-
-    def start_api():
-        """mineru-api with the models loaded; started on the first request
-        (and again after an unload). It keeps its working files under
-        ./output, so it runs in a scratch dir inside the container (the
-        image's /work isn't mounted here; the container, scratch included,
-        is gone when the job ends)."""
-        global API_URL
-        proc = subprocess.Popen(["mineru-api", "--host", "127.0.0.1", "--port", str(API_PORT),
-                                 "--enable-vlm-preload", "true"],
-                                cwd=tempfile.mkdtemp(prefix="mineru-api-"),
-                                stdout=open(os.path.join(queue, "api.log"), "a"),
-                                stderr=subprocess.STDOUT)
-        API_URL = f"http://127.0.0.1:{API_PORT}"
-        for _ in range(600):   # models load here
-            if proc.poll() is not None:
-                err(f"[mineru2md] mineru-api exited ({proc.returncode}); see api.log")
-                sys.exit(4)
-            try:
-                urllib.request.urlopen(API_URL + "/docs", timeout=2)
-                return proc
-            except Exception:
-                time.sleep(1)
-        proc.kill()
-        err("[mineru2md] mineru-api did not come up in 10 minutes")
-        sys.exit(4)
-
-    def stop_api(proc):
-        if proc is None or proc.poll() is not None:
-            return
-        proc.terminate()
-        try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
 
     req_dir = os.path.join(queue, "requests")
     os.makedirs(req_dir, exist_ok=True)
@@ -617,7 +620,7 @@ def serve(queue):
             t0, rc = time.time(), 0
             api_start = 0.0
             if api is None or api.poll() is not None:
-                api = start_api()
+                api = start_api(queue)
                 api_start = time.time() - t0
             try:
                 convert(build_parser().parse_args(argv))
@@ -680,11 +683,23 @@ def convert_batch(in_dir, out_dir, args):
         if not args.quiet:
             err(*a)
     os.makedirs(out_dir, exist_ok=True)
-    main_pass = run_mineru_batch(in_dir, args.method, args.backend, args.lang, log,
-                                 want_middle_json=args.middle_json)
-    ref_pass = {}
-    if args.reconcile and args.backend != args.reconcile_backend:
-        ref_pass = run_mineru_batch(in_dir, args.method, args.reconcile_backend, args.lang, log)
+    # one mineru-api for the whole batch, and the main and reference passes
+    # sent to it at the same time: models load once (not once per CLI call)
+    # and the GPU works on both passes together
+    from concurrent.futures import ThreadPoolExecutor
+    api = start_api(out_dir)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            main_f = pool.submit(run_mineru_batch, in_dir, args.method, args.backend, args.lang,
+                                 log, want_middle_json=args.middle_json)
+            ref_f = None
+            if args.reconcile and args.backend != args.reconcile_backend:
+                ref_f = pool.submit(run_mineru_batch, in_dir, args.method,
+                                    args.reconcile_backend, args.lang, log)
+            main_pass = main_f.result()
+            ref_pass = ref_f.result() if ref_f else {}
+    finally:
+        stop_api(api)
     failed = 0
     for stem, res in main_pass.items():
         if res is None:

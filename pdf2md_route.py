@@ -204,6 +204,11 @@ def err(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+# threads per text container (see docker_text); 0 = the libraries' default.
+# pdf2md_batch.py sets it to the machine's threads / its parallel workers.
+CONTAINER_THREADS = 0
+
+
 def docker_text(workdir: Path, argv: list[str], dev_bind: bool,
                 capture: bool = False, entrypoint: str | None = None):
     """Run the pdf2md-text container exactly the way pdf2md.sh does
@@ -212,6 +217,13 @@ def docker_text(workdir: Path, argv: list[str], dev_bind: bool,
     cmd = ["docker", "run", "--rm", *docker_user(), *DOCKER_HARDEN, "-e", "HOME=/tmp",
            "-v", "/etc/passwd:/etc/passwd:ro", "-v", "/etc/group:/etc/group:ro",
            "-v", f"{workdir}:/work"]
+    if CONTAINER_THREADS:
+        # parallel containers each start a full set of math-library threads
+        # by default (one per core); a job running many at once gives each
+        # its share instead, so they don't fight over the CPUs
+        n = str(CONTAINER_THREADS)
+        cmd += ["-e", f"OMP_NUM_THREADS={n}", "-e", f"OMP_THREAD_LIMIT={n}",
+                "-e", f"MKL_NUM_THREADS={n}", "-e", f"OPENBLAS_NUM_THREADS={n}"]
     if dev_bind:
         cmd += ["-v", f"{REPO/'engines/text/pdf2md.py'}:/usr/local/bin/pdf2md.py:ro",
                 "-v", f"{REPO/'engines/text/verify_text.py'}:/usr/local/bin/verify_text.py:ro"]
