@@ -21,7 +21,27 @@
 LOCK_FILE="${PDF2MD_MINERU_LOCK:-/tmp/pdf2md-mineru.lock}"
 set -euo pipefail
 
-if [ $# -lt 1 ]; then echo "usage: $0 INPUT.pdf [args...]" >&2; exit 1; fi
+if [ $# -lt 1 ]; then echo "usage: $0 INPUT.pdf [args...]  |  $0 --batch JOBDIR [args...]" >&2; exit 1; fi
+
+# --batch JOBDIR: every PDF in JOBDIR/in through ONE MinerU container and one
+# MinerU call per backend (models load once; the CLI batches the pages across
+# documents for the GPU), outputs to JOBDIR/out. Used by pdf2md_batch.py for a
+# job's whole GPU stage. Same hardening as below; only JOBDIR is mounted.
+if [ "$1" = "--batch" ]; then
+  JOB="$(cd "${2:?usage: $0 --batch JOBDIR}" && pwd)"; shift 2
+  MODELS="${MINERU_MODELS:-$HOME/.cache/mineru-models}"
+  mkdir -p "$MODELS" "$JOB/out"
+  echo "[mineru.sh] batch: waiting for GPU lock ($LOCK_FILE)..." >&2
+  exec flock "$LOCK_FILE" docker run --rm --gpus all \
+    --user "$(id -u):$(id -g)" -e HOME=/tmp \
+    -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+    --network none --shm-size 32g \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --pids-limit 4096 --memory 20g \
+    -v "$MODELS":/models \
+    -v "$JOB":/work \
+    pdf2md-mineru --batch /work/in /work/out "$@"
+fi
 IN="$1"; shift || true
 if [ ! -f "$IN" ]; then echo "no such file: $IN" >&2; exit 1; fi
 

@@ -228,6 +228,19 @@ plain words, and unloads the model afterwards. An icon that can't be
 labelled shows as `[icon]`. Off by default: without the flag, output is
 unchanged. The labels are listed in the manifest under `icons`.
 
+## Many files: one job, the whole machine (`pdf2md_batch.py`)
+
+`pdf2md_batch.py a.pdf b.pdf ...` (or a directory) converts a set of PDFs as
+one job in stages across all of them, each using the machine in full, with
+worker counts sized from the machine (CPU threads, free RAM): analysis in
+parallel on the CPU; every OCR run of the job through one MinerU container and
+one MinerU call per backend, so models load once and vLLM batches pages across
+documents, while the text-engine pages convert in parallel on the CPU; every
+icon labelled in one pass once MinerU has exited; then each document's
+merge, manifest and checks in parallel. Each document's output is exactly what
+`pdf2md_route.py` writes for it alone (same stages, same finishing code).
+`tools/uat.py --batch` runs the regression cases through it.
+
 ## MinerU start-up: one server per job
 
 A fresh MinerU container spends ~30 s loading models before seconds of GPU

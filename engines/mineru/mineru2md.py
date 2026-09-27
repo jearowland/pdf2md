@@ -310,6 +310,16 @@ def run_mineru(input_path, method, backend, lang, log, want_content_list=False,
             sys.exit(4)
 
         stem = os.path.splitext(os.path.basename(input_path))[0]
+        return _collect(outdir, stem, backend, log, t0, want_content_list, want_images,
+                        want_middle_json)
+
+
+def _collect(outdir, stem, backend, log, t0, want_content_list, want_images,
+             want_middle_json, exact_only=False):
+    """Read one document's results out of a MinerU output tree. exact_only:
+    in a batch the tree holds many documents, so only this stem's own .md
+    counts (never another document's as a fallback)."""
+    if True:
         candidates = glob.glob(os.path.join(outdir, "**", "*.md"), recursive=True)
         if not candidates:
             err(f"[mineru2md] ERROR: mineru ({backend}) produced no .md under {outdir}")
@@ -319,6 +329,9 @@ def run_mineru(input_path, method, backend, lang, log, want_content_list=False,
             sys.exit(5)
 
         exact = [c for c in candidates if os.path.splitext(os.path.basename(c))[0] == stem]
+        if exact_only and not exact:
+            err(f"[mineru2md] ERROR: mineru ({backend}) produced no .md for {stem}")
+            return None
         chosen = exact[0] if exact else sorted(candidates, key=lambda p: os.path.getsize(p))[-1]
         with open(chosen, "r", encoding="utf-8") as f:
             md = f.read()
@@ -484,6 +497,13 @@ def build_parser():
 
 def main():
     argv = sys.argv[1:]
+    if argv[:1] == ["--batch"]:
+        if len(argv) < 3:
+            err("usage: mineru2md --batch IN_DIR OUT_DIR [options]")
+            sys.exit(2)
+        args = build_parser().parse_args(["-"] + argv[3:])
+        convert_batch(argv[1], argv[2], args)
+        return
     if argv[:1] == ["--serve"]:
         if len(argv) != 2:
             err("usage: mineru2md --serve QUEUE_DIR")
@@ -629,6 +649,56 @@ def serve(queue):
         err("[mineru2md] server stopping")
 
 
+def run_mineru_batch(in_dir, method, backend, lang, log, want_middle_json=False):
+    """One MinerU call over every PDF in in_dir (the CLI batches and runs
+    them concurrently against one API, so vLLM gets many pages at once);
+    {stem: (md, content_list, images, middle_json) or None}."""
+    t0 = time.time()
+    stems = sorted(os.path.splitext(f)[0] for f in os.listdir(in_dir) if f.endswith(".pdf"))
+    with tempfile.TemporaryDirectory() as outdir:
+        cmd = ["mineru", "-p", in_dir, "-o", outdir, "-m", method, "-b", backend]
+        if lang:
+            cmd += ["-l", lang]
+        if API_URL:
+            cmd += ["--api-url", API_URL]
+        log(f"[mineru2md] running on {len(stems)} document(s): {' '.join(cmd)}")
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            # some documents may still have come through; each is checked below
+            err(f"[mineru2md] WARNING: mineru ({backend}) exited {proc.returncode}")
+            err(proc.stderr[-2000:] if proc.stderr else "(no stderr)")
+        return {stem: _collect(outdir, stem, backend, log, t0, True, True, want_middle_json,
+                               exact_only=True) for stem in stems}
+
+
+def convert_batch(in_dir, out_dir, args):
+    """--batch: every PDF in in_dir through one MinerU call per backend, each
+    finished exactly as a single conversion (see finish); outputs go to
+    out_dir/<stem>.md with the usual siblings. Exit 0 if every document came
+    through, 4 otherwise (the ones that did are still written)."""
+    def log(*a):
+        if not args.quiet:
+            err(*a)
+    os.makedirs(out_dir, exist_ok=True)
+    main_pass = run_mineru_batch(in_dir, args.method, args.backend, args.lang, log,
+                                 want_middle_json=args.middle_json)
+    ref_pass = {}
+    if args.reconcile and args.backend != args.reconcile_backend:
+        ref_pass = run_mineru_batch(in_dir, args.method, args.reconcile_backend, args.lang, log)
+    failed = 0
+    for stem, res in main_pass.items():
+        if res is None:
+            failed += 1
+            continue
+        md, content_list_json, images, middle_json = res
+        ref = ref_pass.get(stem)
+        finish(md, content_list_json, images, middle_json, ref[0] if ref else None,
+               os.path.join(out_dir, stem + ".md"), log)
+    log(f"[mineru2md] batch: {len(main_pass) - failed} of {len(main_pass)} document(s) converted")
+    if failed:
+        sys.exit(4)
+
+
 def convert(args):
     """One document through MinerU, as the command line describes it."""
     def log(*a):
@@ -645,8 +715,22 @@ def convert(args):
         args.input, args.method, args.backend, args.lang, log,
         want_content_list=True, want_images=True, want_middle_json=args.middle_json)
 
+    ref_md = None
     if args.reconcile and args.backend != args.reconcile_backend:
         ref_md, _, _, _ = run_mineru(args.input, args.method, args.reconcile_backend, args.lang, log)
+    if args.output:
+        finish(md, content_list_json, images, middle_json, ref_md, args.output, log)
+    else:
+        sys.stdout.write(finish(md, content_list_json, None, None, ref_md, None, log))
+    log(f"[mineru2md] total {time.time()-t0:.1f}s")
+
+
+def finish(md, content_list_json, images, middle_json, ref_md, output, log):
+    """Everything after MinerU for one document -- spelling reconciliation,
+    page markers, title index, sibling files -- shared by single and batch
+    runs so both write exactly the same thing. Returns the markdown."""
+    args = argparse.Namespace(output=output)
+    if ref_md is not None:
         md, _ = reconcile_spelling(md, ref_md, log)
         # content_list_json's page_idx/bbox geometry is unaffected by spelling
         # reconciliation (word-for-word text substitution only, layout untouched)
@@ -658,8 +742,6 @@ def convert(args):
         md += format_title_index(index)
     else:
         log("[mineru2md] no content_list.json available -- skipping page markers and title index")
-
-    log(f"[mineru2md] total {time.time()-t0:.1f}s ({len(md)} chars)")
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
@@ -695,8 +777,7 @@ def convert(args):
                 f.write(md)
             log(f"[mineru2md] wrote {len(images)} image(s) to {images_out_dir} "
                 f"(content-hash filenames within this document's own subfolder)")
-    else:
-        sys.stdout.write(md)
+    return md
 
 
 if __name__ == "__main__":

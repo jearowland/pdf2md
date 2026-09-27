@@ -120,13 +120,49 @@ def convert(pdf: Path, out_md: Path, remote: str | None, dev_bind: bool,
     subprocess.run(["ssh", remote, f"rm -rf {q(rdir)}"], check=False)
 
 
+def run_batch(cases: list[dict], run_dir: Path, args) -> None:
+    """--batch: convert the cases as jobs through pdf2md_batch.py (one job
+    per distinct router_args), on --remote if given; outputs land in each
+    case's folder for check_case."""
+    groups: dict[tuple, list[dict]] = {}
+    for c in cases:
+        groups.setdefault(tuple(c.get("router_args", [])), []).append(c)
+    q = shlex.quote
+    for n, (extra, group) in enumerate(groups.items()):
+        job = run_dir / f"batch-{n}"
+        job.mkdir(parents=True, exist_ok=True)
+        for c in group:
+            shutil.copyfile(c["pdf"], job / f"{c['id']}.pdf")
+        print(f"[uat] batch job {n}: {len(group)} case(s) {' '.join(extra)}", file=sys.stderr)
+        if args.remote:
+            rdir = f"pdf2md/tmp/uat-batch/{run_dir.name}-{n}"
+            subprocess.run(["ssh", args.remote, f"rm -rf {q(rdir)} && mkdir -p {q(rdir)}"], check=True)
+            subprocess.run(["scp", "-q", *[str(job / f"{c['id']}.pdf") for c in group],
+                            f"{args.remote}:{rdir}/"], check=True)
+            subprocess.run(["ssh", args.remote, f"cd ~/pdf2md && python3 pdf2md_batch.py "
+                            f"{q(rdir)} " + " ".join(q(a) for a in extra)], check=False)
+            subprocess.run(["scp", "-q", f"{args.remote}:{rdir}/*.md",
+                            f"{args.remote}:{rdir}/*.manifest.json", str(job)], check=False)
+            subprocess.run(["ssh", args.remote, f"rm -rf {q(rdir)}"], check=False)
+        else:
+            subprocess.run([sys.executable, str(REPO / "pdf2md_batch.py"), str(job), *extra],
+                           check=False)
+        for c in group:
+            for suffix in (".md", ".manifest.json"):
+                src = job / f"{c['id']}{suffix}"
+                if src.exists():
+                    (run_dir / c["id"]).mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(src, run_dir / c["id"] / f"{c['id']}{suffix}")
+
+
 def check_case(case: dict, run_dir: Path, args) -> dict:
     cid = case["id"]
     exp = case.get("expect", {})
     work = run_dir / cid
     work.mkdir(parents=True, exist_ok=True)
     pdf = work / f"{cid}.pdf"
-    shutil.copyfile(case["pdf"], pdf)
+    if not pdf.exists():
+        shutil.copyfile(case["pdf"], pdf)
     fails: list[str] = []
     result = {"id": cid, "defect": case.get("defect", ""), "pages": case["pages"]}
 
@@ -136,11 +172,16 @@ def check_case(case: dict, run_dir: Path, args) -> dict:
         warnings = []
     else:
         out_md = work / f"{cid}.md"
-        try:
-            convert(pdf, out_md, args.remote, args.dev_bind, case.get("router_args", []))
-        except subprocess.CalledProcessError as e:
-            result.update(status="FAIL", failures=[f"conversion failed: {e}"])
-            return result
+        if args.batch:
+            if not out_md.exists():   # converted by run_batch, or it failed there
+                result.update(status="FAIL", failures=["conversion failed in the batch job"])
+                return result
+        else:
+            try:
+                convert(pdf, out_md, args.remote, args.dev_bind, case.get("router_args", []))
+            except subprocess.CalledProcessError as e:
+                result.update(status="FAIL", failures=[f"conversion failed: {e}"])
+                return result
         man = json.loads(out_md.with_suffix(".manifest.json").read_text())
         got_eng = {p["page"]: p["engine"] for p in man["per_page"]}
         warnings = man.get("warnings", [])
@@ -169,6 +210,9 @@ def main() -> None:
                     help="convert on this worker (its ~/pdf2md at this commit)")
     ap.add_argument("--ids", help="comma-separated case ids to run (default: all)")
     ap.add_argument("--out", help="run folder (default tmp/uat/<commit>[-dirty])")
+    ap.add_argument("--batch", action="store_true",
+                    help="convert all cases as one job through pdf2md_batch.py (the "
+                         "production path for multi-file jobs), then check each")
     ap.add_argument("--no-mineru-server", action="store_true",
                     help="remote runs: one-shot MinerU containers, as before this server "
                          "existed -- no run-wide server and none per document "
@@ -201,7 +245,9 @@ def main() -> None:
     print(f"[uat] {len(cases)} case(s), commit {head}{'-dirty' if dirty else ''}, "
           f"tier {tier} -> {run_dir}", file=sys.stderr)
     global REMOTE_MINERU_SERVER
-    if args.remote and not args.classify_only and not args.no_mineru_server:
+    if args.batch and not args.classify_only:
+        run_batch(cases, run_dir, args)
+    elif args.remote and not args.classify_only and not args.no_mineru_server:
         # one MinerU for the whole run: models load once, not once per case
         REMOTE_MINERU_SERVER = subprocess.run(
             ["ssh", args.remote, "cd ~/pdf2md && tools/mineru-session start"],

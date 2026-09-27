@@ -160,36 +160,43 @@ def free_mineru_gpu(need_mb: int | None, timeout: int = 180) -> bool:
     return False
 
 
-def label_icons(icon_dir: Path, icons: list[dict], url: str, model: str) -> list[dict]:
+def _ollama_call(url: str, payload: dict, timeout: int = 180) -> dict:
+    import urllib.request
+    req = urllib.request.Request(url.rstrip("/") + "/api/generate",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def unload_ollama(url: str, model: str) -> None:
+    """keep_alive 0: free the card for the next job."""
+    try:
+        _ollama_call(url, {"model": model, "keep_alive": 0}, timeout=60)
+    except Exception as e:
+        err(f"[route] alt text: could not unload {model}: {e}")
+
+
+def label_icons(icon_dir: Path, icons: list[dict], url: str, model: str,
+                unload: bool = True) -> list[dict]:
     """Ask a local vision model (Ollama at `url`) for each icon's label; an
     icon it can't label keeps an empty label (rendered "[icon]"). The model is
     unloaded afterwards (keep_alive 0) so the card is free for the next job.
     Runs on the host: the engine containers have no network."""
     import base64
-    import urllib.request
-
-    def call(payload: dict, timeout: int = 180) -> dict:
-        req = urllib.request.Request(url.rstrip("/") + "/api/generate",
-                                     data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-
     out = []
     for icon in icons:
         label = ""
         try:
             img = base64.b64encode((icon_dir / icon["file"]).read_bytes()).decode()
-            reply = call({"model": model, "prompt": ALT_TEXT_PROMPT, "images": [img],
-                          "stream": False, "options": {"temperature": 0}})
+            reply = _ollama_call(url, {"model": model, "prompt": ALT_TEXT_PROMPT, "images": [img],
+                                       "stream": False, "options": {"temperature": 0}})
             label = clean_label(reply.get("response", ""))
         except Exception as e:
             err(f"[route] alt text: icon {icon['file']} not labelled: {e}")
         out.append({"page": icon["page"], "rect": icon["rect"], "label": label})
-    try:
-        call({"model": model, "keep_alive": 0}, timeout=60)
-    except Exception as e:
-        err(f"[route] alt text: could not unload {model}: {e}")
+    if unload:
+        unload_ollama(url, model)
     return out
 
 
@@ -320,88 +327,32 @@ def table_rows_per_page(md: str, total_pages: int) -> dict[int, int]:
     return counts
 
 
-RUN_SECS: list[dict] = []   # per-run wall time, for the manifest's timings
+def piece_paths(doc: dict, a: int, b: int) -> tuple[Path, Path]:
+    """(slice pdf, chunk md) for run a-b; a whole-document run uses the
+    prepared pdf itself, no slice."""
+    w, stem = doc["workdir"], doc["stem"]
+    pdf = doc["pdf"] if (a, b) == (1, doc["pc"]) else w / f"{stem}.p{a:04d}-{b:04d}.pdf"
+    return pdf, w / f"{stem}.p{a:04d}-{b:04d}.md"
 
 
-def convert_runs(runs, pdf, pc, workdir, stem, labels, args):
-    """Slice each run out and convert it through its engine; [(run, md)]."""
-    parts: list[tuple[tuple[int, int, str], Path]] = []
-    RUN_SECS.clear()
-    for a, b, eng in runs:
-        t_run = time.time()
-        if (a, b) == (1, pc):
-            piece_pdf = pdf                      # fast path: no slice needed
-        else:
-            piece_pdf = workdir / f"{stem}.p{a:04d}-{b:04d}.pdf"
-            docker_text(workdir, [f"/work/{pdf.name}", "--slice", f"{a}-{b}",
-                                  "-o", f"/work/{piece_pdf.name}"], args.dev_bind)
-        piece_md = workdir / f"{stem}.p{a:04d}-{b:04d}.md"
-        if eng == "text":
-            argv = [f"/work/{piece_pdf.name}", "-o", f"/work/{piece_md.name}"]
-            run_labels = [{**l, "page": l["page"] - a + 1} for l in labels
-                          if a <= l["page"] <= b]
-            if run_labels:
-                lab_path = workdir / f"{stem}.p{a:04d}-{b:04d}.icon-labels.json"
-                lab_path.write_text(json.dumps(run_labels), encoding="utf-8")
-                argv += ["--icon-labels", f"/work/{lab_path.name}"]
-            docker_text(workdir, argv, args.dev_bind)
-        else:
-            # via mineru.sh so the host-wide GPU flock applies. -o is
-            # forwarded into the container verbatim and must be relative to
-            # the input's directory (mounted as /work) -- an absolute host
-            # path is invisible in there.
-            subprocess.run([str(MINERU_SH), str(piece_pdf),
-                            "-o", piece_md.name], check=True)
-        parts.append(((a, b, eng), piece_md))
-        RUN_SECS.append({"pages": [a, b], "engine": eng, "secs": round(time.time() - t_run, 1)})
-    return parts
-
-
-def main():
-    ap = argparse.ArgumentParser(description="per-page engine routing for PDF->md")
-    ap.add_argument("input")
-    ap.add_argument("-o", "--output", required=True,
-                    help="output markdown path (manifest lands beside it)")
-    ap.add_argument("--no-derotate", action="store_true")
-    ap.add_argument("--whole-doc-ocr-ratio", type=float, default=WHOLE_DOC_OCR_RATIO)
-    ap.add_argument("--max-runs", type=int, default=MAX_RUNS)
-    ap.add_argument("--keep-parts", action="store_true",
-                    help="keep per-run slice PDFs and chunk markdowns")
-    ap.add_argument("--alt-text-ollama", metavar="URL",
-                    help="label icon-sized images on text-engine pages with a local vision "
-                         "model at this Ollama URL (e.g. http://localhost:11434 on a GPU "
-                         "worker); written into the output as [icon: label]. Off by default.")
-    ap.add_argument("--alt-text-model", default="qwen2.5vl:7b",
-                    help="Ollama vision model for --alt-text-ollama (default qwen2.5vl:7b)")
-    ap.add_argument("--dev-bind", action="store_true",
-                    help="overlay local engines/text/pdf2md.py into the "
-                         "container (test classifier changes pre-rebuild)")
-    args = ap.parse_args()
-
+def analyze(input_path: str, output_path: str, opts) -> dict:
+    """Everything before conversion, CPU only: derotate, prepare (covered
+    text out, ligatures repaired), classify, plan the runs, slice them, and
+    crop icons on text-engine pages when alt text is on. One dict per
+    document, consumed by the convert_* stages and finalize."""
     t0 = time.time()
-    timings: dict = {}
-    last = [t0]
-
-    def mark(name):
-        now = time.time()
-        timings[name] = round(now - last[0], 1)
-        last[0] = now
-    pdf = Path(args.input).resolve()
-    out_md = Path(args.output).resolve()
+    pdf = Path(input_path).resolve()
+    out_md = Path(output_path).resolve()
     workdir = pdf.parent
     if out_md.parent != workdir:
-        err("[route] ERROR: -o must sit beside the input PDF (single /work mount)")
-        sys.exit(6)
+        raise SystemExit("[route] ERROR: -o must sit beside the input PDF (single /work mount)")
     stem = pdf.stem
-
     # 1. derotate (geometry only; same sibling-artifact convention as auto.sh)
-    if not args.no_derotate:
-        err("[route] checking page rotation...")
+    if not opts.no_derotate:
+        err(f"[route] {pdf.name}: checking page rotation...")
         docker_text(workdir, [f"/work/{pdf.name}", "--derotate",
-                              f"/work/{stem}.derotated.pdf"], args.dev_bind)
+                              f"/work/{stem}.derotated.pdf"], opts.dev_bind)
         pdf = workdir / f"{stem}.derotated.pdf"
-
-    mark("derotate")
     # 1b. the copy every engine converts: text hidden under opaque rectangles
     # (cosmetic redactions, text under a panel) removed -- an OCR engine reads
     # only what renders, a text-layer engine would read it all -- and ligature
@@ -409,85 +360,111 @@ def main():
     # needing neither is copied byte for byte.
     r = docker_text(workdir, [f"/work/{pdf.name}", "--prepare",
                               f"/work/{stem}.prepared.pdf", "--quiet"],
-                    args.dev_bind, capture=True)
+                    opts.dev_bind, capture=True)
     prepared = parse_json_report(r.stdout)
     covered = {c["page"]: c for c in prepared["pages"]}
     pdf = workdir / f"{stem}.prepared.pdf"
     if covered:
-        err(f"[route] removed text hidden under opaque shapes on page(s) {sorted(covered)}")
+        err(f"[route] {stem}: removed text hidden under opaque shapes on page(s) {sorted(covered)}")
     for f in prepared["ligature_fixes"]:
-        err(f"[route] font {f['font']}: {len(f['glyphs'])} ligature glyph(s) given their text back")
-
-    mark("prepare")
+        err(f"[route] {stem}: font {f['font']}: {len(f['glyphs'])} ligature glyph(s) "
+            f"given their text back")
     # 2. per-page classification (facts only)
     r = docker_text(workdir, [f"/work/{pdf.name}", "--classify-pages", "--quiet"],
-                    args.dev_bind, capture=True)
+                    opts.dev_bind, capture=True)
     report = parse_json_report(r.stdout)
     per_page, pc = report["per_page"], report["pages"]
-
     # 3. plan
-    runs = plan_runs(per_page, args.whole_doc_ocr_ratio, args.max_runs)
-    err(f"[route] {pc} pages -> {len(runs)} run(s): " +
+    runs = plan_runs(per_page, opts.whole_doc_ocr_ratio, opts.max_runs)
+    err(f"[route] {stem}: {pc} pages -> {len(runs)} run(s): " +
         ", ".join(f"p{a}-{b}:{e}" for a, b, e in runs))
-
-    mark("classify")
-    # 3b. alt text for icons on text-engine pages (opt-in): crop them in the
-    # container, label them here on the host, hand each text run its labels
-    labels: list[dict] = []
-    if args.alt_text_ollama and any(eng == "text" for _, _, eng in runs):
+    doc = {"input": input_path, "out_md": out_md, "workdir": workdir, "stem": stem,
+           "pdf": pdf, "pc": pc, "per_page": per_page, "runs": runs, "covered": covered,
+           "prepared": prepared, "icons": [], "labels": [], "chunks": {},
+           "timings": {}, "t0": t0}
+    # slices for every run that isn't the whole document
+    for a, b, eng in runs:
+        piece_pdf, _ = piece_paths(doc, a, b)
+        if piece_pdf != pdf:
+            docker_text(workdir, [f"/work/{pdf.name}", "--slice", f"{a}-{b}",
+                                  "-o", f"/work/{piece_pdf.name}"], opts.dev_bind)
+    # 3b. icons on text-engine pages (alt text, opt-in): cropped here; the
+    # labels come later, in one pass, once the GPU is free of MinerU
+    if opts.alt_text_ollama and any(eng == "text" for _, _, eng in runs):
         icon_dir = workdir / f"{stem}.icons"
         icon_dir.mkdir(exist_ok=True)
         r = docker_text(workdir, [f"/work/{pdf.name}", "--extract-icons",
                                   f"/work/{icon_dir.name}", "--quiet"],
-                        args.dev_bind, capture=True)
+                        opts.dev_bind, capture=True)
         text_pages = {p for a, b, eng in runs if eng == "text" for p in range(a, b + 1)}
-        icons = [i for i in json.loads(r.stdout[r.stdout.find("["):] or "[]")
-                 if i["page"] in text_pages]
-        size = ollama_model_mb(args.alt_text_ollama, args.alt_text_model)
-        # the model's weights plus room to run it (context, image tokens)
-        need = int(size * 1.3) + 512 if size else None
-        if icons and free_mineru_gpu(need):
-            labels = label_icons(icon_dir, icons, args.alt_text_ollama, args.alt_text_model)
-            err(f"[route] alt text: {sum(1 for l in labels if l['label'])} of "
-                f"{len(labels)} icon(s) labelled")
-        if not args.keep_parts:
-            for f in icon_dir.glob("*"):
-                f.unlink()
-            icon_dir.rmdir()
+        doc["icon_dir"] = icon_dir
+        doc["icons"] = [i for i in json.loads(r.stdout[r.stdout.find("["):] or "[]")
+                        if i["page"] in text_pages]
+    doc["timings"]["analyze"] = round(time.time() - t0, 1)
+    return doc
 
-    mark("alt_text")
-    # 4. convert each run. Two or more MinerU runs share one MinerU server for
-    # this document (models load once), unless the caller already runs one
-    # for its whole job (PDF2MD_MINERU_SERVER).
-    import os
-    import signal
-    # a TERM (a job being stopped) unwinds through the finally below and
-    # stops this document's server; a KILL leaves it to the server's own
-    # idle timeout
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-    own_session = None
-    # PDF2MD_MINERU_SERVER=off: one-shot containers, as before (baselines)
-    if sum(1 for _, _, e in runs if e == "mineru") >= 2 and not os.environ.get("PDF2MD_MINERU_SERVER"):
-        own_session = subprocess.run([str(REPO / "tools" / "mineru-session"), "start"],
-                                     check=True, capture_output=True, text=True).stdout.strip()
-        os.environ["PDF2MD_MINERU_SERVER"] = own_session
-        err(f"[route] MinerU server for this document: {own_session}")
-    try:
-        parts = convert_runs(runs, pdf, pc, workdir, stem, labels, args)
-    finally:
-        if own_session:
-            subprocess.run([str(REPO / "tools" / "mineru-session"), "stop", own_session], check=False)
-            del os.environ["PDF2MD_MINERU_SERVER"]
 
-    mark("convert")
-    timings["runs"] = RUN_SECS[:]
+def convert_text_run(doc: dict, run: tuple, opts) -> None:
+    """One text-engine run (CPU), with its icons' labels if any."""
+    a, b, _ = run
+    t = time.time()
+    piece_pdf, piece_md = piece_paths(doc, a, b)
+    argv = [f"/work/{piece_pdf.name}", "-o", f"/work/{piece_md.name}"]
+    run_labels = [{**l, "page": l["page"] - a + 1} for l in doc["labels"]
+                  if a <= l["page"] <= b]
+    if run_labels:
+        lab_path = doc["workdir"] / f"{doc['stem']}.p{a:04d}-{b:04d}.icon-labels.json"
+        lab_path.write_text(json.dumps(run_labels), encoding="utf-8")
+        argv += ["--icon-labels", f"/work/{lab_path.name}"]
+    docker_text(doc["workdir"], argv, opts.dev_bind)
+    doc["chunks"][(a, b)] = {"engine": "text", "secs": round(time.time() - t, 1)}
+
+
+def convert_mineru_run(doc: dict, run: tuple) -> None:
+    """One MinerU run on its own (single-document path): via mineru.sh, so the
+    host-wide GPU lock applies and a job's server is used if there is one.
+    -o is forwarded into the container verbatim and must be relative to the
+    input's directory (mounted as /work)."""
+    a, b, _ = run
+    t = time.time()
+    piece_pdf, piece_md = piece_paths(doc, a, b)
+    subprocess.run([str(MINERU_SH), str(piece_pdf), "-o", piece_md.name], check=True)
+    doc["chunks"][(a, b)] = {"engine": "mineru", "secs": round(time.time() - t, 1)}
+
+
+def label_all_icons(docs: list[dict], opts) -> None:
+    """Label every icon of every document in one pass, with at most one
+    GPU swap: called once MinerU is done (its container has exited, or a
+    job's server is asked to unload only if the vision model won't fit)."""
+    icons = [(d, i) for d in docs for i in d["icons"]]
+    if not icons:
+        return
+    size = ollama_model_mb(opts.alt_text_ollama, opts.alt_text_model)
+    need = int(size * 1.3) + 512 if size else None   # weights plus room to run
+    if not free_mineru_gpu(need):
+        return
+    t = time.time()
+    for d in docs:
+        if d["icons"]:
+            d["labels"] = label_icons(d["icon_dir"], d["icons"], opts.alt_text_ollama,
+                                      opts.alt_text_model, unload=False)
+    unload_ollama(opts.alt_text_ollama, opts.alt_text_model)
+    n = sum(1 for d in docs for l in d["labels"] if l["label"])
+    err(f"[route] alt text: {n} of {len(icons)} icon(s) labelled in {time.time() - t:.0f}s")
+
+
+def finalize(doc: dict, opts) -> None:
+    """Merge the runs, write the manifest, run the report-only checks, tidy."""
+    t = time.time()
+    workdir, stem, pc, runs = doc["workdir"], doc["stem"], doc["pc"], doc["runs"]
+    out_md, per_page, covered, pdf = doc["out_md"], doc["per_page"], doc["covered"], doc["pdf"]
     # 5. merge with global page numbering. Markers sit BETWEEN pages inside a
     # chunk; at each chunk boundary we add the boundary page's marker
     # explicitly (except before global page 1) so global numbering never
     # depends on which engine produced the previous chunk.
     merged: list[str] = []
-    for (a, b, eng), piece_md in parts:
-        chunk = piece_md.read_text(encoding="utf-8", errors="replace")
+    for a, b, eng in runs:
+        chunk = piece_paths(doc, a, b)[1].read_text(encoding="utf-8", errors="replace")
         chunk = renumber(chunk, a)
         if a > 1:
             merged.append(f"\n\n<!-- page {a} -->\n\n")
@@ -499,7 +476,7 @@ def main():
     final += text_engine().format_title_index(text_engine().build_title_index(final))
     out_md.write_text(final, encoding="utf-8")
 
-    # 6. manifest: facts + the two domain-free warnings
+    # 6. manifest: facts + the domain-free warnings
     rows = table_rows_per_page(final, pc)
     emitted_last = max([int(m.group(1)) for m in
                         PAGE_MARKER_RE.finditer(final)] + [1])
@@ -523,7 +500,6 @@ def main():
                              "page": p["page"],
                              "detail": f"text layer has {p['text_chars']} chars "
                                        f"but output segment is near-empty"})
-
     for c in covered.values():
         warnings.append({"kind": "covered_text_removed", "page": c["page"],
                          "covered_chars": c["covered_chars"],
@@ -532,7 +508,6 @@ def main():
                                    f"shapes were removed (cosmetic redaction or text under a "
                                    f"panel); {c['redaction_markers']} block(s) under dark "
                                    f"fills are marked [redacted] in the output"})
-
     # content-loss check: per page, how much of the text layer's wording the
     # output kept (engines/text/verify_text.py). Report-only, like
     # verify_numbers: a failure to check never fails the conversion.
@@ -540,17 +515,18 @@ def main():
     try:
         r = docker_text(workdir, ["/usr/local/bin/verify_text.py",
                                   f"/work/{pdf.name}", f"/work/{out_md.name}", "--json"],
-                        args.dev_bind, capture=True, entrypoint="python3")
+                        opts.dev_bind, capture=True, entrypoint="python3")
         vt = parse_json_report(r.stdout)
         recall_by_page = {p["page"]: p["recall"] for p in vt["per_page"]}
         warnings.extend(vt["warnings"])
         for w in vt["warnings"]:
-            err(f"[route] WARNING page {w['page']}: {w['detail']}")
+            err(f"[route] {stem}: WARNING page {w['page']}: {w['detail']}")
     except Exception as e:
-        err(f"[route] text-coverage check did not run: {e}")
-
+        err(f"[route] {stem}: text-coverage check did not run: {e}")
+    doc["timings"]["runs"] = [{"pages": [a, b], **doc["chunks"].get((a, b), {})}
+                              for a, b, _ in runs]
     manifest = {
-        "source": str(Path(args.input).name),
+        "source": str(Path(doc["input"]).name),
         "pdf_pages": pc,
         "engine_runs": [{"pages": [a, b], "engine": e} for a, b, e in runs],
         "per_page": [{**p, "engine": next(e for a, b, e in runs
@@ -560,14 +536,12 @@ def main():
                       "text_layer_recall": recall_by_page.get(p["page"]),
                       "covered_text_chars": covered.get(p["page"], {}).get("covered_chars", 0)}
                      for p in per_page],
-        "ligature_fixes": prepared["ligature_fixes"],
-        "icons": labels,
+        "ligature_fixes": doc["prepared"]["ligature_fixes"],
+        "icons": doc["labels"],
         "warnings": warnings,
+        "timings": doc["timings"],
     }
     man_path = out_md.with_suffix(".manifest.json")
-    man_path.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
-
-    mark("merge_and_checks")
     # 7. number-preservation check (unchanged from auto.sh, report-only)
     try:
         subprocess.run(["docker", "run", "--rm", "-v", f"{workdir}:/work",
@@ -580,25 +554,85 @@ def main():
                        check=False)
     except Exception:
         pass
-
-    if not args.keep_parts:
-        for (a, b, eng), piece_md in parts:
+    if not opts.keep_parts:
+        for a, b, eng in runs:
+            piece_pdf, piece_md = piece_paths(doc, a, b)
             if piece_md != out_md:
                 piece_md.unlink(missing_ok=True)
             # engines write provenance siblings per piece; remove those too
             Path(str(piece_md)[:-3] + ".content_list.json").unlink(missing_ok=True)
-            piece_pdf = workdir / f"{stem}.p{a:04d}-{b:04d}.pdf"
-            piece_pdf.unlink(missing_ok=True)
+            if piece_pdf != pdf:
+                piece_pdf.unlink(missing_ok=True)
             (workdir / f"{stem}.p{a:04d}-{b:04d}.icon-labels.json").unlink(missing_ok=True)
-
-    mark("verify_numbers")
-    manifest["timings"] = timings
+        icon_dir = doc.get("icon_dir")
+        if icon_dir and icon_dir.is_dir():
+            for f in icon_dir.glob("*"):
+                f.unlink()
+            icon_dir.rmdir()
+    doc["timings"]["finalize"] = round(time.time() - t, 1)
+    manifest["timings"] = doc["timings"]
     man_path.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
-    err("[route] timings (s): " + ", ".join(f"{k} {v}" for k, v in timings.items() if k != "runs")
-        + "; runs " + ", ".join(f"p{r['pages'][0]}-{r['pages'][1]} {r['engine']} {r['secs']}"
-                               for r in timings["runs"]))
     err(f"[route] wrote {out_md} + {man_path.name} "
-        f"({len(warnings)} warning(s)) in {time.time()-t0:.1f}s")
+        f"({len(warnings)} warning(s)) in {time.time() - doc['t0']:.1f}s")
+
+
+def add_options(ap: argparse.ArgumentParser) -> None:
+    """Options shared by this router and pdf2md_batch.py."""
+    ap.add_argument("--no-derotate", action="store_true")
+    ap.add_argument("--whole-doc-ocr-ratio", type=float, default=WHOLE_DOC_OCR_RATIO)
+    ap.add_argument("--max-runs", type=int, default=MAX_RUNS)
+    ap.add_argument("--keep-parts", action="store_true",
+                    help="keep per-run slice PDFs and chunk markdowns")
+    ap.add_argument("--alt-text-ollama", metavar="URL",
+                    help="label icon-sized images on text-engine pages with a local vision "
+                         "model at this Ollama URL (e.g. http://localhost:11434 on a GPU "
+                         "worker); written into the output as [icon: label]. Off by default.")
+    ap.add_argument("--alt-text-model", default="qwen2.5vl:7b",
+                    help="Ollama vision model for --alt-text-ollama (default qwen2.5vl:7b)")
+    ap.add_argument("--dev-bind", action="store_true",
+                    help="overlay local engines/text/pdf2md.py into the "
+                         "container (test classifier changes pre-rebuild)")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="per-page engine routing for PDF->md")
+    ap.add_argument("input")
+    ap.add_argument("-o", "--output", required=True,
+                    help="output markdown path (manifest lands beside it)")
+    add_options(ap)
+    opts = ap.parse_args()
+
+    doc = analyze(opts.input, opts.output, opts)
+    # OCR first, then icon labels (the GPU is free of MinerU by then), then
+    # the text runs, which need the labels. Two or more MinerU runs share one
+    # MinerU server for this document (models load once), unless the caller
+    # runs one for its whole job (PDF2MD_MINERU_SERVER; "off" = one-shot).
+    import os
+    import signal
+    # a TERM (a job being stopped) unwinds through the finally below and
+    # stops this document's server; a KILL leaves it to the server's own
+    # idle timeout
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    ocr_runs = [r for r in doc["runs"] if r[2] == "mineru"]
+    own_session = None
+    if len(ocr_runs) >= 2 and not os.environ.get("PDF2MD_MINERU_SERVER"):
+        own_session = subprocess.run([str(REPO / "tools" / "mineru-session"), "start"],
+                                     check=True, capture_output=True, text=True).stdout.strip()
+        os.environ["PDF2MD_MINERU_SERVER"] = own_session
+        err(f"[route] MinerU server for this document: {own_session}")
+    try:
+        for run in ocr_runs:
+            convert_mineru_run(doc, run)
+    finally:
+        if own_session:
+            subprocess.run([str(REPO / "tools" / "mineru-session"), "stop", own_session], check=False)
+            del os.environ["PDF2MD_MINERU_SERVER"]
+    if opts.alt_text_ollama:
+        label_all_icons([doc], opts)
+    for run in doc["runs"]:
+        if run[2] == "text":
+            convert_text_run(doc, run, opts)
+    finalize(doc, opts)
 
 
 if __name__ == "__main__":
