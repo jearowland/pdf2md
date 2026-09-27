@@ -140,7 +140,8 @@ def run_batch(cases: list[dict], run_dir: Path, args) -> None:
             subprocess.run(["scp", "-q", *[str(job / f"{c['id']}.pdf") for c in group],
                             f"{args.remote}:{rdir}/"], check=True)
             subprocess.run(["ssh", args.remote, f"cd ~/pdf2md && python3 pdf2md_batch.py "
-                            f"{q(rdir)} " + " ".join(q(a) for a in extra)], check=False)
+                            f"{q(rdir.removeprefix('pdf2md/'))} " + " ".join(q(a) for a in extra)],
+                           check=False)
             subprocess.run(["scp", "-q", f"{args.remote}:{rdir}/*.md",
                             f"{args.remote}:{rdir}/*.manifest.json", str(job)], check=False)
             subprocess.run(["ssh", args.remote, f"rm -rf {q(rdir)}"], check=False)

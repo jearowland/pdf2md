@@ -140,6 +140,8 @@ def main():
 
     pdfs = []
     for p in map(Path, opts.inputs):
+        if not p.exists():
+            sys.exit(f"[batch] no such file or directory: {p}")
         pdfs += sorted(p.glob("*.pdf")) if p.is_dir() else [p]
     # a directory may hold earlier runs' artifacts; convert originals only
     pdfs = [p.resolve() for p in pdfs
