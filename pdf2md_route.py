@@ -102,6 +102,113 @@ def text_engine():
     return sys.modules["pdf2md_text_engine"]
 
 
+ALT_TEXT_PROMPT = ("This is a small icon cut from a document. Reply with a label of one to "
+                   "five words saying what it shows (for example: bus, phone, warning sign, "
+                   "tick). Reply with the label only.")
+
+
+def clean_label(text: str) -> str:
+    """A model reply as a 1-5 word label: first line, letters, digits,
+    spaces and hyphens only, lower case. Anything else is dropped, so a
+    chatty or odd reply can't inject markup into the output."""
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    words = re.sub(r"[^A-Za-z0-9 \-]", " ", line).lower().split()
+    # "bus icon" -> "bus": the output already says [icon: ...]
+    while len(words) > 1 and words[-1] in ("icon", "symbol", "pictogram"):
+        words.pop()
+    if len(words) > 1 and words[0] in ("a", "an", "the"):
+        words.pop(0)
+    return " ".join(words[:5])
+
+
+def gpu_free_mb() -> int | None:
+    """Free VRAM on this host's GPU (MiB), or None if it can't be read."""
+    for smi in ("nvidia-smi", "/usr/lib/wsl/lib/nvidia-smi"):
+        try:
+            out = subprocess.run([smi, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            return int(out.split()[0])
+        except Exception:
+            continue
+    return None
+
+
+def ollama_model_mb(url: str, model: str) -> int | None:
+    """The Ollama model's size on disk (MiB), or None."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/tags", timeout=10) as resp:
+            for m in json.loads(resp.read()).get("models", []):
+                if m.get("name") == model or m.get("model") == model:
+                    return int(m["size"] / 2**20)
+    except Exception:
+        pass
+    return None
+
+
+def free_mineru_gpu(need_mb: int | None, timeout: int = 180) -> bool:
+    """Make room on the GPU for a model needing need_mb: if this job's MinerU
+    server is loaded and free VRAM is short (or unknown), ask it to unload
+    and wait until it has. When both fit (titan: MinerU ~15 GB plus the
+    vision model ~7.5 GB on 24 GB), nothing is unloaded -- a reload costs
+    ~46 s. A 12 GB card can't hold both and would run out."""
+    import os
+    q = os.environ.get("PDF2MD_MINERU_SERVER", "")
+    if not q or not Path(q, "requests").is_dir() or Path(q, "exited").exists():
+        return True
+    free = gpu_free_mb()
+    if need_mb is not None and free is not None and free >= need_mb:
+        return True
+    Path(q, "unloaded").unlink(missing_ok=True)
+    Path(q, "unload").touch()
+    for _ in range(timeout):
+        if Path(q, "unloaded").exists() or Path(q, "exited").exists():
+            return True
+        time.sleep(1)
+    err("[route] alt text: the MinerU server did not unload in time; skipping alt text")
+    return False
+
+
+def _ollama_call(url: str, payload: dict, timeout: int = 180) -> dict:
+    import urllib.request
+    req = urllib.request.Request(url.rstrip("/") + "/api/generate",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def unload_ollama(url: str, model: str) -> None:
+    """keep_alive 0: free the card for the next job."""
+    try:
+        _ollama_call(url, {"model": model, "keep_alive": 0}, timeout=60)
+    except Exception as e:
+        err(f"[route] alt text: could not unload {model}: {e}")
+
+
+def label_icons(icon_dir: Path, icons: list[dict], url: str, model: str,
+                unload: bool = True) -> list[dict]:
+    """Ask a local vision model (Ollama at `url`) for each icon's label; an
+    icon it can't label keeps an empty label (rendered "[icon]"). The model is
+    unloaded afterwards (keep_alive 0) so the card is free for the next job.
+    Runs on the host: the engine containers have no network."""
+    import base64
+    out = []
+    for icon in icons:
+        label = ""
+        try:
+            img = base64.b64encode((icon_dir / icon["file"]).read_bytes()).decode()
+            reply = _ollama_call(url, {"model": model, "prompt": ALT_TEXT_PROMPT, "images": [img],
+                                       "stream": False, "options": {"temperature": 0}})
+            label = clean_label(reply.get("response", ""))
+        except Exception as e:
+            err(f"[route] alt text: icon {icon['file']} not labelled: {e}")
+        out.append({"page": icon["page"], "rect": icon["rect"], "label": label})
+    if unload:
+        unload_ollama(url, model)
+    return out
+
+
 def err(*a):
     print(*a, file=sys.stderr, flush=True)
 
