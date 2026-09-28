@@ -274,18 +274,40 @@ BACKGROUND_MIN_CHARS_PER_PAGE_AREA = 500
 BACKGROUND_MIN_CHARS = 20
 
 
+# References to None that PyMuPDF has taken and never given back, re-added
+# here (see _restore_none_refs); grows only by what it loses.
+_NONE_BANK: list = []
+# None references held for the duration of each guarded call: one call on a
+# page of ~124,000 vector paths dropped more than None had, and the process
+# died inside the call, before any after-the-fact top-up could run
+NONE_PREPAY = 2_000_000
+
+
 @contextlib.contextmanager
 def _restore_none_refs():
-    """Give back the references to None that PyMuPDF 1.28.x's get_bboxlog(),
-    get_texttrace() and get_drawings() drop (see _drawing_facts). Copy what
-    you need out of their results and drop them inside the block."""
-    import ctypes
+    """Guard PyMuPDF calls that drop references to None (1.28.x's
+    get_bboxlog(), get_texttrace(), get_drawings() and more; on Python 3.11
+    None is not immortal, and a run of a few thousand pages aborted with
+    "none_dealloc"). A block of references is held during the call, so it
+    can't reach zero inside it; afterwards whatever the call lost is re-added
+    for good (_NONE_BANK). Copy what you need out of PyMuPDF's results and
+    drop them inside the block. Remove once the image runs a fixed PyMuPDF
+    or Python 3.12+."""
+    if sys.version_info >= (3, 12):   # None is immortal: nothing to guard
+        yield
+        return
     before = sys.getrefcount(None)
+    prepaid = [None] * NONE_PREPAY
     try:
         yield
     finally:
-        for _ in range(max(before - sys.getrefcount(None), 0)):
-            ctypes.pythonapi.Py_IncRef(ctypes.py_object(None))
+        # count the loss and bank it BEFORE letting go of the prepaid block:
+        # one call can lose more than None had to begin with, and releasing
+        # the block first took the count through zero
+        lost = (before + NONE_PREPAY) - sys.getrefcount(None)
+        if lost > 0:
+            _NONE_BANK.extend([None] * lost)
+        del prepaid
 
 
 # A digital page reads upright when at least this share of its visible text
@@ -320,7 +342,7 @@ def _text_reads_upright(page):
     return upright >= UPRIGHT_MIN_SHARE * total
 
 
-def _drawing_facts(page):
+def _drawing_facts(page, want_rects=False):
     """(images, text_spans, opaque_rects) in drawing order, as plain Python
     values: images [(Rect, seqno)] for every fill-image command; text_spans
     [(seqno, visible, Rect, nonspace_chars)] for every text span; and
@@ -337,25 +359,41 @@ def _drawing_facts(page):
     Over-restoring only keeps None alive, which it always is; under-restoring
     is the crash. Remove this once the image runs a fixed PyMuPDF or Python
     3.12+."""
-    import ctypes
     import pymupdf
-    before = sys.getrefcount(None)
-    log = page.get_bboxlog()
-    images = [(pymupdf.Rect(b), i) for i, (kind, b) in enumerate(log)
-              if kind == "fill-image"]
-    trace = page.get_texttrace()
-    # render mode 3 is invisible text: the search-index OCR layer of a scan
-    # or a pasted screenshot sits over the image but isn't what a reader sees
-    spans = [(s["seqno"], s["type"] != 3 and s["opacity"] > 0, pymupdf.Rect(s["bbox"]),
-              sum(1 for c in s["chars"] if not chr(c[0]).isspace()))
-             for s in trace]
-    drawings = page.get_drawings()
-    rects = [(d["seqno"], pymupdf.Rect(d["rect"]), tuple(d["fill"]))
-             for d in drawings if _opaque_rect(d)]
-    del log, trace, drawings
-    for _ in range(max(before - sys.getrefcount(None), 0)):
-        ctypes.pythonapi.Py_IncRef(ctypes.py_object(None))
+    with _restore_none_refs():
+        log = page.get_bboxlog()
+        images = [(pymupdf.Rect(b), i) for i, (kind, b) in enumerate(log)
+                  if kind == "fill-image"]
+        trace = page.get_texttrace()
+        # render mode 3 is invisible text: the search-index OCR layer of a scan
+        # or a pasted screenshot sits over the image but isn't what a reader sees
+        spans = [(s["seqno"], s["type"] != 3 and s["opacity"] > 0, pymupdf.Rect(s["bbox"]),
+                  sum(1 for c in s["chars"] if not chr(c[0]).isspace()))
+                 for s in trace]
+        rects = _cover_paths(log, spans) if want_rects else []
+        del log, trace
     return images, spans, rects
+
+
+def _cover_paths(log, spans):
+    """[(seqno, Rect, None)] for the filled paths in the drawing log big
+    enough to cover a visible span (at least ~80% of its width and height).
+    From the bboxlog alone -- kind and box, cheap -- never get_drawings(),
+    which builds a Python object per vector path: a real report had ~124,000
+    per page and spent minutes in it. Whether a candidate really hides text
+    is decided by the rendered page (find_covered_text), not by the path's
+    shape or declared fill, so nothing more about the path is needed."""
+    import numpy as np
+    import pymupdf
+    paths = [(i, b) for i, (kind, b) in enumerate(log) if kind == "fill-path"]
+    boxes = [box for sq, visible, box, n in spans if visible and n and not box.is_empty]
+    if not paths or not boxes:
+        return []
+    pb = np.array([b for _, b in paths], dtype=float)          # x0 y0 x1 y1
+    min_w = 0.79 * min(box.width for box in boxes)
+    min_h = 0.79 * min(box.height for box in boxes)
+    keep = np.nonzero(((pb[:, 2] - pb[:, 0]) >= min_w) & ((pb[:, 3] - pb[:, 1]) >= min_h))[0]
+    return [(paths[k][0], pymupdf.Rect(paths[k][1]), None) for k in keep]
 
 
 def _opaque_rect(d):
@@ -429,13 +467,14 @@ def _redaction_rect(box):
     return pymupdf.Rect(box.x0, box.y0 + inset, box.x1, box.y1 - inset)
 
 
-def _render(page, dpi):
-    """(pixmap, had_errors) for the page, MuPDF's error printing silenced."""
+def _render(page, dpi, clip=None):
+    """(pixmap, had_errors) for the page (or just `clip` of it), MuPDF's
+    error printing silenced."""
     import pymupdf
     display = pymupdf.TOOLS.mupdf_display_errors()
     pymupdf.TOOLS.mupdf_display_errors(False)
     pymupdf.TOOLS.mupdf_warnings(reset=True)
-    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csRGB, alpha=False)
+    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csRGB, alpha=False, clip=clip)
     errors = "error" in pymupdf.TOOLS.mupdf_warnings(reset=True)
     pymupdf.TOOLS.mupdf_display_errors(display)
     return pix, errors
@@ -452,31 +491,52 @@ def find_covered_text(page):
     if rot:
         page.set_rotation(0)
     try:
-        return _find_covered_unrotated(page)
+        # the whole check under the None-refcount guard (see _drawing_facts):
+        # more of PyMuPDF than the drawing calls leaks (text pages, clipped
+        # renders, redaction), and a corpus run died of it here
+        with _restore_none_refs():
+            return _find_covered_unrotated(page)
     finally:
         if rot:
             page.set_rotation(rot)
 
 
 def _find_covered_unrotated(page):
-    """Visible text spans hidden by an opaque rectangle drawn on top of them:
+    """Visible text spans hidden by a filled shape drawn on top of them:
     cosmetic redactions (black bars over text that is still in the file) and
-    text tucked under a panel. A span counts only if the geometry says a
-    later opaque rectangle covers it AND removing it leaves the rendered page
-    unchanged (see COVERED_MAX_PIXELS). [(span_rect, nonspace_chars, fill_rgb)]."""
+    text tucked under a panel. A span counts only if a filled path drawn
+    after it covers most of its box (the drawing log, see _cover_paths) AND
+    removing it leaves the rendered page unchanged (see COVERED_MAX_PIXELS)
+    -- the render is the proof, so the path's shape and declared fill don't
+    matter. [(span_rect, nonspace_chars, fill_rgb as rendered)]."""
     import pymupdf
-    _, spans, rects = _drawing_facts(page)
+    import numpy as np
+    _, spans, rects = _drawing_facts(page, want_rects=True)
+    if not rects:
+        return []
+    rseq = np.array([r[0] for r in rects])
+    rb = np.array([tuple(r[1]) for r in rects], dtype=float)
     candidates = []
     for sq, visible, box, n in spans:
         if not visible or n == 0 or box.is_empty:
             continue
-        for rsq, rect, fill in rects:
-            if rsq > sq and (box & rect).get_area() >= COVERED_MIN_SHARE * box.get_area():
-                candidates.append((box, n, fill))
-                break
+        later = rseq > sq
+        if not later.any():
+            continue
+        b = rb[later]
+        w = np.clip(np.minimum(b[:, 2], box.x1) - np.maximum(b[:, 0], box.x0), 0, None)
+        h = np.clip(np.minimum(b[:, 3], box.y1) - np.maximum(b[:, 1], box.y0), 0, None)
+        if (w * h >= COVERED_MIN_SHARE * box.get_area()).any():
+            candidates.append((box, n, None))
     if not candidates:
         return []
-    before, errors = _render(page, COVERED_RENDER_DPI)
+    # only the area the candidates sit in is rendered: a page of ~124,000
+    # vector paths took seconds per full render
+    clip = pymupdf.Rect(candidates[0][0])
+    for box, _, _ in candidates[1:]:
+        clip |= box
+    clip = (clip + (-2, -2, 2, 2)) & page.rect
+    before, errors = _render(page, COVERED_RENDER_DPI, clip)
     # a page MuPDF can't render faithfully proves nothing (a pattern fill it
     # doesn't understand renders as solid black over a readable page)
     if errors:
@@ -490,9 +550,10 @@ def _find_covered_unrotated(page):
         cpage.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
                                graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
                                text=pymupdf.PDF_REDACT_TEXT_REMOVE)
-        after, errors = _render(cpage, COVERED_RENDER_DPI)
+        after, errors = _render(cpage, COVERED_RENDER_DPI, clip)
         # "unchanged" only means hidden if the text really was removed
-        still_there = [bool(cpage.get_textbox(_redaction_rect(box)).strip())
+        tp = cpage.get_textpage()   # once: rebuilding it per span cost minutes on heavy pages
+        still_there = [bool(cpage.get_textbox(_redaction_rect(box), textpage=tp).strip())
                        for box, _, _ in candidates]
         copy.close()
     except Exception:
@@ -500,21 +561,28 @@ def _find_covered_unrotated(page):
     if errors or (after.width, after.height) != (before.width, before.height):
         return []
     scale = COVERED_RENDER_DPI / 72
+    ox, oy = before.x, before.y      # the clip's origin, in pixels
+    pb_arr = np.frombuffer(before.samples, dtype=np.uint8).reshape(
+        before.height, before.width, before.n)[:, :, :3].astype(np.int16)
+    pa_arr = np.frombuffer(after.samples, dtype=np.uint8).reshape(
+        after.height, after.width, after.n)[:, :, :3].astype(np.int16)
     covered = []
     for (box, n, fill), kept in zip(candidates, still_there):
         if kept:
             continue
         r = box & page.rect
-        x0, y0 = max(int(r.x0 * scale), 0), max(int(r.y0 * scale), 0)
-        x1, y1 = min(int(r.x1 * scale) + 1, before.width), min(int(r.y1 * scale) + 1, before.height)
-        total = changed = 0
-        for y in range(y0, y1):
-            for x in range(x0, x1):
-                total += 1
-                pb, pa = before.pixel(x, y), after.pixel(x, y)
-                if any(abs(pb[k] - pa[k]) > COVERED_PIXEL_TOLERANCE for k in range(3)):
-                    changed += 1
+        x0, y0 = max(int(r.x0 * scale) - ox, 0), max(int(r.y0 * scale) - oy, 0)
+        x1 = min(int(r.x1 * scale) + 1 - ox, before.width)
+        y1 = min(int(r.y1 * scale) + 1 - oy, before.height)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        b, a = pb_arr[y0:y1, x0:x1], pa_arr[y0:y1, x0:x1]
+        total = b.shape[0] * b.shape[1]
+        changed = int((np.abs(b - a) > COVERED_PIXEL_TOLERANCE).any(axis=2).sum())
         if total and changed <= COVERED_MAX_PIXELS:
+            # the covering colour, as rendered where the text sat: dark
+            # (a redaction bar) gets a [redacted] marker, anything else not
+            fill = tuple(float(v) / 255 for v in b.reshape(-1, 3).mean(axis=0))
             covered.append((box, n, fill))
     return covered
 

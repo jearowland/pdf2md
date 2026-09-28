@@ -279,6 +279,22 @@ page images) its API outgrew a fixed 20 GB cap and was killed mid-batch.
 once, and caps the container at this machine's RAM less 7 GB (at most 24 GB);
 `pdf2md_batch.py` sizes its CPU workers during OCR from what that leaves.
 
+### Pages with huge numbers of vector paths
+
+A real report had ~124,000 vector paths on every page. PyMuPDF's
+`get_drawings()` builds a Python object per path, and the covered-text
+check and background hiding called it on every page: one document held up
+a whole batch for most of an hour. Now only the drawing log (kind and box)
+is read, screened with numpy; whether a candidate really hides text is
+decided by the render comparison alone (so the covering shape no longer has
+to be a rectangle), and only the candidate area is rendered. On 800 corpus
+PDFs every page flagged before is still flagged; 48 more, all confirmed
+hidden (page numbers under panels and the like), none an amount.
+
+The text container runs Python 3.12: PyMuPDF 1.28 drops references to
+`None`, which on Python 3.11 crashed long runs ("none_dealloc"); on 3.12
+`None` is immortal. Output is byte-identical between the two.
+
 ## Regression testing
 
 `tools/uat.py` re-checks every verified fix against a **private** case list

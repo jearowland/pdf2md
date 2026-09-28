@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.12-slim-bookworm
 
 # tesseract-ocr is used ONLY for its orientation-and-script-detection (OSD) mode:
 # a fast, purely geometric per-page rotation check (no text recognition, no
