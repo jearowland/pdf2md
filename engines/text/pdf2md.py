@@ -1490,6 +1490,38 @@ def main():
             sys.exit(6)
         return
 
+    def copy_pages(dst, src, a, b):
+        """Pages a..b (1-indexed) of src into dst. A damaged source -- a
+        truncated download whose page tree points at objects that aren't in
+        the file ("non-page object in page tree", then "source object number
+        out of range" / "not a dict" on copying, on a real report) -- is
+        copied page by page, and a page that can't be copied becomes a blank
+        page of the same size: page numbers stay right, what's readable still
+        converts, and the log names the pages that were lost."""
+        import pymupdf
+        try:
+            dst.insert_pdf(src, from_page=a - 1, to_page=b - 1)
+            return
+        except (RuntimeError, ValueError):
+            pass
+        lost = []
+        for i in range(a - 1, b):
+            before = len(dst)
+            try:
+                dst.insert_pdf(src, from_page=i, to_page=i)
+            except (RuntimeError, ValueError):
+                while len(dst) > before:          # drop anything half-copied
+                    dst.delete_page(len(dst) - 1)
+                try:
+                    r = src[i].rect
+                except Exception:
+                    r = pymupdf.paper_rect("a4")
+                dst.new_page(width=r.width, height=r.height)
+                lost.append(i + 1)
+        if lost:
+            err(f"[pdf2md] WARNING: {os.path.basename(args.input)} is damaged (truncated?): "
+                f"page(s) {lost} can't be read and are left blank")
+
     if args.combine:
         if not args.output:
             err("[pdf2md] ERROR: --combine requires -o OUTPUT.pdf")
@@ -1499,9 +1531,11 @@ def main():
             import pymupdf
             src = pymupdf.open(args.input)
             ranges = [tuple(int(x) for x in r.split("-", 1)) for r in args.combine.split(",")]
-            dst = pymupdf.open()
-            layout = []
-            for i, (a, b) in enumerate(ranges):
+
+            def build(src):
+              dst = pymupdf.open()
+              layout = []
+              for i, (a, b) in enumerate(ranges):
                 if not (1 <= a <= b <= len(src)):
                     err(f"[pdf2md] ERROR: --combine range {a}-{b} out of range (1-{len(src)})")
                     sys.exit(2)
@@ -1512,8 +1546,10 @@ def main():
                     prev = src[ranges[i - 1][1] - 1].rect
                     dst.new_page(width=prev.width, height=prev.height)
                 first = len(dst)
-                dst.insert_pdf(src, from_page=a - 1, to_page=b - 1)
+                copy_pages(dst, src, a, b)
                 layout.append({"pages": [a, b], "first": first, "last": len(dst) - 1})
+              return dst, layout
+            dst, layout = build(src)
             dst.save(args.output)
             print(json.dumps(layout))
             log(f"[pdf2md] --combine: wrote {len(ranges)} range(s), {len(dst)} page(s) -> {args.output}")
@@ -1536,7 +1572,7 @@ def main():
                 err(f"[pdf2md] ERROR: --slice {args.slice} out of range (1-{len(src)})")
                 sys.exit(2)
             dst = pymupdf.open()
-            dst.insert_pdf(src, from_page=a - 1, to_page=b - 1)
+            copy_pages(dst, src, a, b)
             dst.save(args.output)
             log(f"[pdf2md] --slice: wrote pages {a}-{b} -> {args.output}")
         except SystemExit:

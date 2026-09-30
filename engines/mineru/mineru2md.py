@@ -353,6 +353,8 @@ def _collect(outdir, stem, backend, log, t0, want_content_list, want_images,
     counts (never another document's as a fallback)."""
     if True:
         candidates = glob.glob(os.path.join(outdir, "**", "*.md"), recursive=True)
+        if not candidates and exact_only:
+            return None     # the batch caller decides what a missing document means
         if not candidates:
             err(f"[mineru2md] ERROR: mineru ({backend}) produced no .md under {outdir}")
             err("[mineru2md] tree: " + ", ".join(
@@ -772,12 +774,28 @@ def convert_batch(in_dir, out_dir, args):
     try:
         main_pass = run_mineru_batch(in_dir, args.method, args.backend, args.lang, log,
                                      want_middle_json=True)
-        ref_pass = {}
-        if args.reconcile and args.backend != args.reconcile_backend:
-            ref_pass = run_mineru_batch(in_dir, args.method, args.reconcile_backend, args.lang,
-                                        log, want_middle_json=True)
     finally:
         stop_api(api)
+    # the reference pass only feeds spelling reconciliation: it gets a fresh
+    # mineru-api (with both passes' models in one process it was OOM-killed
+    # on a 16.9 GB cap), and whatever it can't deliver just means no
+    # spelling check for those documents -- never a failed document
+    ref_pass = {}
+    if args.reconcile and args.backend != args.reconcile_backend:
+        api = None
+        try:
+            api = start_api(out_dir)
+            ref_pass = run_mineru_batch(in_dir, args.method, args.reconcile_backend, args.lang,
+                                        log, want_middle_json=True)
+        except SystemExit:
+            err("[mineru2md] batch: reference pass failed; documents go without the spelling check")
+            ref_pass = {}
+        finally:
+            stop_api(api)
+        missing = [k for k, v in ref_pass.items() if v is None] if ref_pass else []
+        if missing:
+            log(f"[mineru2md] batch: no reference pass for {len(missing)} document(s); "
+                f"they go without the spelling check")
     failed = 0
     for stem, res in main_pass.items():
         if res is None:
@@ -826,8 +844,11 @@ def convert(args):
                           want_content_list=True, want_images=True, want_middle_json=True)
         ref = None
         if args.reconcile and args.backend != args.reconcile_backend:
-            ref = run_mineru(args.input, args.method, args.reconcile_backend, args.lang, log,
-                             want_middle_json=True)
+            try:
+                ref = run_mineru(args.input, args.method, args.reconcile_backend, args.lang, log,
+                                 want_middle_json=True)
+            except SystemExit:
+                err("[mineru2md] reference pass failed; going without the spelling check")
         out_dir = os.path.dirname(os.path.abspath(args.output)) if args.output else os.getcwd()
         finish_runs(runs, main, ref, args.backend, args.reconcile_backend, out_dir, log)
         log(f"[mineru2md] {len(runs)} run(s) in {time.time()-t0:.1f}s")
@@ -839,7 +860,11 @@ def convert(args):
 
     ref_md = None
     if args.reconcile and args.backend != args.reconcile_backend:
-        ref_md, _, _, _ = run_mineru(args.input, args.method, args.reconcile_backend, args.lang, log)
+        try:
+            ref_md, _, _, _ = run_mineru(args.input, args.method, args.reconcile_backend,
+                                         args.lang, log)
+        except SystemExit:
+            err("[mineru2md] reference pass failed; going without the spelling check")
     if args.output:
         finish(md, content_list_json, images, middle_json, ref_md, args.output, log)
     else:
