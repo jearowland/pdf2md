@@ -178,6 +178,7 @@ def main():
         return any(a <= i["page"] <= b for i in d["icons"])
     text_now = [(d, r) for d in docs for r in d["runs"] if r[2] == "text" and not needs_labels(d, r)]
     text_later = [(d, r) for d in docs for r in d["runs"] if r[2] == "text" and needs_labels(d, r)]
+    (REPO / "tmp").mkdir(exist_ok=True)   # git-ignored, so absent in a fresh clone
     with tempfile.TemporaryDirectory(prefix="pdf2md-batch-", dir=REPO / "tmp") as job:
         gpu_failed: dict[str, str] = {}
 

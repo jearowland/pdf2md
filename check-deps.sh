@@ -50,6 +50,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Docker as this script can reach it: right after step 2 adds you to the docker
+# group, THIS shell isn't in it yet, so the GPU checks below go through sudo
+# (a fresh install otherwise failed them although the GPU worked)
+if docker info >/dev/null 2>&1; then DOCKER=(docker); else DOCKER=(sudo docker); fi
+
 log "3/4 NVIDIA Container Toolkit (GPU support for the MinerU engine)"
 GPU_PRESENT=0
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -71,7 +76,7 @@ if [ "$GPU_PRESENT" -eq 0 ]; then
 else
   ok "GPU detected: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo '(name unavailable)')"
   log "checking if Docker can already reach it..."
-  if docker run --rm --gpus all nvidia/cuda:12.5.0-base-ubuntu22.04 nvidia-smi >/dev/null 2>&1; then
+  if "${DOCKER[@]}" run --rm --gpus all nvidia/cuda:12.5.0-base-ubuntu22.04 nvidia-smi >/dev/null 2>&1; then
     ok "docker run --gpus all already works, nothing to install"
   else
     log "installing NVIDIA Container Toolkit..."
@@ -93,7 +98,7 @@ else
       sudo service docker restart 2>/dev/null || log "couldn't auto-restart docker -- restart it manually, then re-run this script to verify"
     fi
     log "verifying..."
-    if docker run --rm --gpus all nvidia/cuda:12.5.0-base-ubuntu22.04 nvidia-smi >/dev/null 2>&1; then
+    if "${DOCKER[@]}" run --rm --gpus all nvidia/cuda:12.5.0-base-ubuntu22.04 nvidia-smi >/dev/null 2>&1; then
       ok "docker run --gpus all now works"
     else
       echo "[check-deps]   ✗ still not working -- run the smoke test yourself to see the real error:" >&2
