@@ -155,7 +155,7 @@ def main():
         pdfs += sorted(p.glob("*.pdf")) if p.is_dir() else [p]
     # a directory may hold earlier runs' artifacts; convert originals only
     pdfs = [p.resolve() for p in pdfs
-            if not re.search(r"\.(derotated|prepared)\.|\.p\d{4}-\d{4}\.pdf$", p.name)]
+            if not re.search(r"\.(derotated|prepared)\.|\.p\d{4}-\d{4}\.pdf$|\.ocr\.pdf$", p.name)]
     if not pdfs:
         sys.exit("[batch] no PDFs given")
     t0 = time.time()
