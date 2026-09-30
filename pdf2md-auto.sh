@@ -113,7 +113,12 @@ while [ $# -gt 0 ]; do
     -o|--output)
       # -o gets forwarded into a container where only $DIR (mounted as /work) is
       # visible, so it must be relative to $DIR, not an absolute host path.
-      OUT_ABS="$(realpath -m "$2")"
+      # a bare file name lands beside the input (as the README says);
+      # a path is taken from the current directory
+      case "$2" in
+        */*) OUT_ABS="$(realpath -m "$2")" ;;
+        *) OUT_ABS="$DIR/$2" ;;
+      esac
       case "$OUT_ABS" in
         "$DIR"/*) REL="${OUT_ABS#$DIR/}" ;;
         *) echo "[pdf2md-auto] ERROR: -o must resolve inside $DIR (only the input file's directory is mounted into the container): $2" >&2; exit 6 ;;

@@ -83,7 +83,10 @@ else
     sudo apt-get update -qq
     sudo apt-get install -y nvidia-container-toolkit
     sudo nvidia-ctk runtime configure --runtime=docker
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
+    # systemd counts as running whenever it is PID 1 -- on a fresh WSL distro it
+    # reports "degraded", and treating that as "no systemd" skipped the restart,
+    # so the GPU check below failed (clean-room test, 2026-10-01)
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
       sudo systemctl restart docker
     else
       # WSL2 without systemd enabled: no service manager, restart the daemon directly
