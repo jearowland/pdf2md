@@ -28,13 +28,12 @@ reported with each case but don't decide pass or fail.
 Two tiers:
   --classify-only   CPU only, seconds per document: classify each page and
                     plan the router's runs, then check engine_per_page. Run
-                    on core after any classifier or routing change.
+                    on any machine after a classifier or routing change.
   (default)         full conversion through pdf2md_route.py, then every
-                    check. Needs MinerU for OCR pages, so on core run it
-                    against a GPU worker:
-                      gpu run --kind convert --needs docker -- \\
-                        tools/uat.py CASES.jsonl --remote '$GPU_HOST'
-                    The worker's ~/pdf2md must be at this checkout's commit.
+                    check. Needs MinerU for OCR pages, so from a machine
+                    without a GPU run it against a GPU host over ssh:
+                      tools/uat.py CASES.jsonl --remote GPU_HOST
+                    The host's ~/pdf2md must be at this checkout's commit.
 
 Source PDFs are copied into the run folder (default tmp/uat/<commit>/) and
 never written beside; results.json there records every check. Exit status

@@ -149,8 +149,8 @@ def ollama_model_mb(url: str, model: str) -> int | None:
 def free_mineru_gpu(need_mb: int | None, timeout: int = 180) -> bool:
     """Make room on the GPU for a model needing need_mb: if this job's MinerU
     server is loaded and free VRAM is short (or unknown), ask it to unload
-    and wait until it has. When both fit (titan: MinerU ~15 GB plus the
-    vision model ~7.5 GB on 24 GB), nothing is unloaded -- a reload costs
+    and wait until it has. When both fit (MinerU ~15 GB plus the vision
+    model ~7.5 GB on a 24 GB card), nothing is unloaded -- a reload costs
     ~46 s. A 12 GB card can't hold both and would run out."""
     import os
     q = os.environ.get("PDF2MD_MINERU_SERVER", "")
@@ -254,7 +254,7 @@ _DOCKER_USER: list[str] | None = None
 def docker_user() -> list[str]:
     """The run's user mapping, as engines/docker-user.sh sets it: --user
     uid:gid under rootful Docker (the GPU workers) so output files stay the
-    caller's; nothing under rootless Docker (core), where the container's
+    caller's; nothing under rootless Docker, where the container's
     root already IS the caller and --user maps to an unrelated subordinate
     uid that can't write the output folder."""
     global _DOCKER_USER

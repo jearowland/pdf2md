@@ -299,14 +299,15 @@ The text container runs Python 3.12: PyMuPDF 1.28 drops references to
 
 `tools/uat.py` re-checks every verified fix against a **private** case list
 (JSONL, kept beside the documents and never in this repo; the format is in
-the script's docstring). Run the routing-only tier on core after any
-classifier or routing change, and the full tier on a GPU worker before
-merging:
+the script's docstring). Run the routing-only tier on any machine after a
+classifier or routing change, and the full tier on a GPU host before merging:
 
 ```bash
 tools/uat.py CASES.jsonl --classify-only --dev-bind       # seconds per document, CPU
-gpu run --kind convert --needs docker -- tools/uat.py CASES.jsonl --remote '$GPU_HOST'
+tools/uat.py CASES.jsonl --remote GPU_HOST                 # full conversion over ssh
 ```
+
+The GPU host needs this repo checked out at `~/pdf2md`, at the same commit.
 
 ## Setup
 

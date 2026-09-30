@@ -2,8 +2,8 @@
 # and how much work MinerU keeps in flight, sized from this machine.
 #
 # At MinerU's defaults (3 concurrent requests, each holding a 64-page window of rendered page images)
-# its API grew past a fixed 20 GB cap and was OOM-killed mid-job on a real batch (titan, 24 GB VM
-# atlas too); and several tasks at once deadlocked its layout model on another. So: fewer pages in
+# its API grew past a fixed 20 GB cap and was OOM-killed mid-job on a real batch (on a 31 GB and
+# a 24 GB machine alike); and several tasks at once deadlocked its layout model on another. So: fewer pages in
 # flight (a 16-page window, ONE request at a time -- with one request per document each carries
 # many pages, so the GPU still gets full batches; override with PDF2MD_MINERU_WINDOW /
 # PDF2MD_MINERU_CONCURRENCY), and a cap of this machine's RAM less 7 GB for
